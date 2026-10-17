@@ -1,6 +1,5 @@
-//! Phase 1 exit gate: run the transport against a real GitHub repository.
+//! This example runs a series of checks against a real GitHub repository.
 //!
-//! ```text
 //! $env:OCTOPAGE_GITHUB_TOKEN = "github_pat_..."
 //! cargo run -p octopage-git --example github_check -- --repo OWNER/NAME
 //! ```

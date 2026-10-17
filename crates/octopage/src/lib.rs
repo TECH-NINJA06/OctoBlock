@@ -1,3 +1,5 @@
+//! A Git-backed SQLite database with transactional commits and optional encryption.
+
 #![deny(missing_docs)]
 
 use std::sync::Arc;
@@ -7,6 +9,7 @@ use octopage_pagestore::PageStore;
 use tokio::runtime::Handle;
 
 mod asof;
+/// Transaction changelog types.
 pub mod changelog;
 mod conn;
 mod error;
@@ -14,6 +17,7 @@ mod settings;
 mod signing;
 mod sql;
 mod value;
+/// GitHub webhook payload types and signature verification.
 pub mod webhook;
 
 pub use changelog::{Changelog, Statement};

@@ -1,6 +1,9 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "policy", rename_all = "snake_case")]
 #[non_exhaustive]
+/// A history-retention policy.
 pub enum Retention {
     /// Never drop a commit (small or audit-critical databases).
     KeepAll,

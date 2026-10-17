@@ -1,38 +1,51 @@
+/// The result type returned by the OctoPage API.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Everything that can go wrong. New kinds may be added, so match with a catch-all arm.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// A SQLite error.
     #[error(transparent)]
     Sql(rusqlite::Error),
 
+    /// A commit lost a race with another writer.
     #[error(
         "the commit was refused: another client changed the same data first; run the transaction again"
     )]
     Conflict,
 
+    /// A transaction exceeded its retry limit.
     #[error("the transaction lost {attempts} races in a row to other writers")]
     Serialization {
+        /// Number of failed commit attempts.
         attempts: u32,
     },
 
+    /// The commit outcome could not be determined after a network failure.
     #[error("the network failed while committing; whether the commit landed is unknown")]
     OutcomeUnknown,
 
+    /// GitHub rejected a commit because it appears to contain a secret.
     #[error("GitHub push protection blocked the commit: something that looks like a secret is in {}", places.join("; "))]
     SecretBlocked {
+        /// Locations identified by the protection response.
         places: Vec<String>,
+        /// The provider's explanatory message.
         message: String,
     },
+    /// The repository or network is unavailable.
     #[error("the repository is unavailable; nothing was committed: {0}")]
     Unavailable(String),
 
+    /// The database exceeded its configured live-size limit.
     #[error("the database is full: {0}")]
     Full(String),
+    /// An encrypted database was requested in a public repository.
     #[error("the repository is public, and this encrypted database requires a private one")]
     PublicRepository,
 
+    /// A merge stopped because replaying a commit failed.
     #[error(
         "the merge stopped after {merged} commits: replaying {commit} failed at `{statement}`: {reason}"
     )]

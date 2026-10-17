@@ -7,6 +7,14 @@ __pycache__/
 .env
 node_modules/
 
+# Local data caches and database files
+octopage-data*/cache/
+octopage-data*/meta.sqlite*
+
+# Native Python build artifacts
+*.pdb
+*.pyd
+
 # Tests and test fixtures
 **/tests/
 **/test/
