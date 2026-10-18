@@ -295,6 +295,18 @@ impl Volume {
         self.budget_soft = bytes;
     }
 
+    /// Set the `.octoblock/policy.toml` blob SHA in the superblock (Section 4.4).
+    pub fn set_policy_sha(&mut self, sha: Vec<u8>) {
+        self.sb.policy_sha = sha;
+    }
+
+    /// Update the 2-bit [`PathClass`] stored in an inode's flags (Section 5.3).
+    pub fn set_inode_path_class(&mut self, ino: u64, class: PathClass) -> Result<()> {
+        let mut rec = self.getattr(ino)?;
+        rec.set_path_class(class);
+        self.put_inode(rec)
+    }
+
     fn check_writable(&self, allocating: bool) -> Result<()> {
         if self.read_only {
             return Err(Error::new(Errno::EROFS, "volume is mounted read-only"));
@@ -1884,6 +1896,7 @@ impl Volume {
     }
 
     /// Finalize the current commit group, writing updated FreeMap pages and Page 0 Superblock (Section 6.2, REQ-1, REQ-11).
+    /// Finalize the current commit group, writing updated FreeMap pages and Page 0 Superblock (Section 6.2, REQ-1, REQ-11).
     pub fn commit_group(&mut self) -> Result<Option<CommittedGroup>> {
         if self.pending_ops.is_empty() {
             return Ok(None); // REQ-11: Empty groups MUST NOT be committed.
@@ -1902,12 +1915,12 @@ impl Volume {
         let ops_count = ops.len();
         let changelog = Bytes::from(encode_changelog(&ops));
 
+        self.sb.epoch += 1;
+        let committed_epoch = self.sb.epoch;
         self.sync_counters();
         self.alloc
-            .write_free_map_pages(&self.sb, self.sb.epoch, &mut self.pages)?;
+            .write_free_map_pages(&self.sb, committed_epoch, &mut self.pages)?;
         self.pages.insert(PageId::SUPERBLOCK, self.sb.encode());
-        let committed_epoch = self.sb.epoch;
-        self.sb.epoch += 1;
         self.alloc.begin_group();
 
         Ok(Some(CommittedGroup {
@@ -2010,5 +2023,36 @@ mod tests {
     #[test]
     fn phase_b_crash_injection_1000_points() {
         run_crash_injection_suite(1_000, 0xCAFE_BABE).unwrap();
+    }
+
+    #[test]
+    fn phase_b_fsck_detect_and_repair() {
+        let mut vol = Volume::mkfs(4096, [0x77; 16], CasePolicy::Sensitive, 1).unwrap();
+        let ino = vol.create(ROOT_INO, b"check.txt", 0o644, 1000, 1000).unwrap();
+        vol.write(ino, 0, &vec![0x33; 8192]).unwrap();
+        vol.commit_group().unwrap();
+
+        // Inject EC-D04 (live_bytes drift) and EC-D06 (orphan with nlink > 0)
+        vol.sb.live_bytes += 4096 * 10;
+        vol.sb.orphan_root = vol
+            .orphan_tree()
+            .insert(
+                &mut vol.pages,
+                &mut vol.alloc,
+                vol.sb.orphan_root,
+                vol.sb.epoch,
+                ino.to_be_bytes().to_vec(),
+                vec![1],
+            )
+            .unwrap();
+
+        let scan = vol.fsck(false).unwrap();
+        assert!(!scan.is_clean(), "fsck must detect injected drift and bogus orphan");
+
+        let repaired = vol.fsck(true).unwrap();
+        assert!(repaired.repaired >= 2);
+
+        let verify = vol.fsck(false).unwrap();
+        assert!(verify.is_clean(), "fsck after repair must be 100% clean: {:?}", verify.problems);
     }
 }

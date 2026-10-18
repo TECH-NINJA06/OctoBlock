@@ -54,6 +54,7 @@ impl Volume {
 
         // 2. Decode all inodes, verify extents, per-file extent trees, and per-inode xattr trees.
         let mut inodes: BTreeMap<u64, InodeRecord> = BTreeMap::new();
+        let mut computed_blocks: BTreeMap<u64, u64> = BTreeMap::new();
         if let Ok(entries) = inode_tree.all_entries(&self.pages, self.sb.inode_root, epoch) {
             for (k, v) in entries {
                 if k.len() != 8 {
@@ -76,15 +77,13 @@ impl Volume {
                 report.inodes_checked += 1;
 
                 // Collect per-inode xattr tree pages
-                if let Some(xroot) = rec.xattr_root {
-                    if let Err(e) = xattr_tree.collect_node_ids(
-                        &self.pages,
-                        xroot.get(),
-                        epoch,
-                        &mut reachable,
-                    ) {
-                        report.problems.push(format!("inode {key_ino} xattr tree: {e}"));
-                    }
+                if let Some(xroot) = rec.xattr_root
+                    && let Err(e) =
+                        xattr_tree.collect_node_ids(&self.pages, xroot.get(), epoch, &mut reachable)
+                {
+                    report
+                        .problems
+                        .push(format!("inode {key_ino} xattr tree: {e}"));
                 }
 
                 let extents: Vec<Extent> = match &rec.data {
@@ -150,6 +149,7 @@ impl Volume {
                         rec.blocks
                     ));
                 }
+                computed_blocks.insert(key_ino, file_blocks);
                 inodes.insert(key_ino, rec);
             }
         }
@@ -197,7 +197,7 @@ impl Volume {
             }
         }
 
-        // 4. Check orphans (EC-D06: orphan with nlink > 0 must be cleared).
+        // 4. Check orphans (EC-D06: orphan with nlink > 0 or missing inode must be cleared).
         let mut orphans_in_tree: BTreeSet<u64> = BTreeSet::new();
         if let Ok(orphan_entries) =
             orphan_tree.all_entries(&self.pages, self.sb.orphan_root, epoch)
@@ -205,11 +205,11 @@ impl Volume {
             for (k, _) in orphan_entries {
                 if k.len() == 8 {
                     let ino = u64::from_be_bytes(k.try_into().unwrap());
-                    orphans_in_tree.insert(ino);
+                    let exists = inodes.contains_key(&ino);
                     let ref_links = expected_nlink.get(&ino).copied().unwrap_or(0);
-                    if ref_links > 0 {
+                    if !exists || ref_links > 0 {
                         report.problems.push(format!(
-                            "orphan inode {ino} has positive directory link count {ref_links} (EC-D06)"
+                            "orphan inode {ino} invalid (exists={exists}, ref_links={ref_links}) (EC-D06)"
                         ));
                         if repair
                             && let Ok((new_root, _)) = orphan_tree.remove(
@@ -223,36 +223,54 @@ impl Volume {
                             self.sb.orphan_root = new_root;
                             report.repaired += 1;
                         }
+                    } else {
+                        orphans_in_tree.insert(ino);
                     }
                 }
             }
         }
 
-        // Compare inode link counts against directory references (EC-D03).
+        // Compare inode link counts and blocks against computed values (EC-D03).
+        let mut purged_inodes = 0usize;
         for (&ino, rec) in &inodes {
             let want_nlink = expected_nlink.get(&ino).copied().unwrap_or(0);
-            if want_nlink == 0 && orphans_in_tree.contains(&ino) {
+            let want_blocks = computed_blocks.get(&ino).copied().unwrap_or(rec.blocks);
+
+            if want_nlink == 0 && !orphans_in_tree.contains(&ino) {
+                report.problems.push(format!(
+                    "inode {ino} has 0 directory references and is not in orphan tree (EC-D03)"
+                ));
+                if repair && self.purge_inode(rec.clone()).is_ok() {
+                    purged_inodes += 1;
+                    report.repaired += 1;
+                }
                 continue;
             }
-            if rec.nlink != want_nlink {
+
+            let nlink_bad = !orphans_in_tree.contains(&ino) && rec.nlink != want_nlink;
+            let blocks_bad = rec.blocks != want_blocks;
+            if nlink_bad && !orphans_in_tree.contains(&ino) {
                 report.problems.push(format!(
                     "inode {ino}: nlink is {}, directory references count is {want_nlink} (EC-D03)",
                     rec.nlink
                 ));
-                if repair {
-                    let mut fixed = rec.clone();
+            }
+            if repair && (nlink_bad || blocks_bad) {
+                let mut fixed = rec.clone();
+                if nlink_bad {
                     fixed.nlink = want_nlink;
-                    if let Ok(new_root) = inode_tree.insert(
-                        &mut self.pages,
-                        &mut self.alloc,
-                        self.sb.inode_root,
-                        epoch,
-                        ino.to_be_bytes().to_vec(),
-                        fixed.encode(),
-                    ) {
-                        self.sb.inode_root = new_root;
-                        report.repaired += 1;
-                    }
+                }
+                fixed.blocks = want_blocks;
+                if let Ok(new_root) = inode_tree.insert(
+                    &mut self.pages,
+                    &mut self.alloc,
+                    self.sb.inode_root,
+                    epoch,
+                    ino.to_be_bytes().to_vec(),
+                    fixed.encode(),
+                ) {
+                    self.sb.inode_root = new_root;
+                    report.repaired += 1;
                 }
             }
         }
@@ -263,7 +281,6 @@ impl Volume {
             for (tree, root) in [
                 (&inode_tree, self.sb.inode_root),
                 (&dentry_tree, self.sb.dentry_root),
-                (&xattr_tree, self.sb.xattr_root),
                 (&orphan_tree, self.sb.orphan_root),
             ] {
                 let _ = tree.collect_node_ids(&self.pages, root, epoch, &mut reachable);
@@ -324,7 +341,7 @@ impl Volume {
 
         report.reachable_pages = reachable.len();
 
-        // 6. Verify FreeMap vs reachable set (EC-D05).
+        // 6. Verify FreeMap and stored non-system pages vs reachable set (EC-D05).
         for &pid in &reachable {
             if !self.alloc.is_allocated(pid) {
                 report.problems.push(format!(
@@ -332,7 +349,27 @@ impl Volume {
                 ));
             }
         }
-        if self.alloc.live_pages() != reachable.len() as u64 {
+        let leaked_pages: Vec<PageId> = self
+            .pages
+            .keys()
+            .copied()
+            .filter(|id| !self.sb.is_system_page(*id) && !reachable.contains(id))
+            .collect();
+        if !leaked_pages.is_empty() {
+            report.problems.push(format!(
+                "{} unreachable non-system page(s) present in page map",
+                leaked_pages.len()
+            ));
+            if repair {
+                for id in leaked_pages {
+                    self.pages.remove(&id);
+                }
+                report.repaired += 1;
+            }
+        }
+        if self.alloc.live_pages() != reachable.len() as u64
+            || reachable.iter().any(|&p| !self.alloc.is_allocated(p))
+        {
             report.problems.push(format!(
                 "allocator live_pages ({}) != reachable pages ({}) (EC-D04/EC-D05)",
                 self.alloc.live_pages(),
@@ -344,7 +381,7 @@ impl Volume {
             }
         }
 
-        // 7. Verify Superblock live_pages and live_bytes counters (EC-D04).
+        // 7. Verify Superblock live_pages, live_bytes, and inode_count counters (EC-D04).
         let actual_live_pages = reachable.len() as u64;
         let actual_live_bytes = actual_live_pages * (page_size as u64);
         if self.sb.live_pages != actual_live_pages || self.sb.live_bytes != actual_live_bytes {
@@ -358,14 +395,14 @@ impl Volume {
                 report.repaired += 1;
             }
         }
-        if self.sb.inode_count != inodes.len() as u64 {
+        let expected_inodes = (inodes.len() - purged_inodes) as u64;
+        if self.sb.inode_count != expected_inodes {
             report.problems.push(format!(
-                "superblock inode_count={} != actual {}",
-                self.sb.inode_count,
-                inodes.len()
+                "superblock inode_count={} != actual {expected_inodes}",
+                self.sb.inode_count
             ));
             if repair {
-                self.sb.inode_count = inodes.len() as u64;
+                self.sb.inode_count = expected_inodes;
                 report.repaired += 1;
             }
         }
@@ -383,6 +420,7 @@ impl Volume {
             self.alloc
                 .write_free_map_pages(&self.sb, self.sb.epoch, &mut self.pages)?;
             self.pages.insert(PageId::SUPERBLOCK, self.sb.encode());
+            self.alloc.begin_group();
         }
         Ok(report)
     }
