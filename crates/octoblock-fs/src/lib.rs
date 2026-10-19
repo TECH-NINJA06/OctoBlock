@@ -295,6 +295,11 @@ impl Volume {
         self.budget_soft = bytes;
     }
 
+    /// Toggle the volume's read-only flag (used when a Follower promotes to Writer via lease break).
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
     /// Set the `.octoblock/policy.toml` blob SHA in the superblock (Section 4.4).
     pub fn set_policy_sha(&mut self, sha: Vec<u8>) {
         self.sb.policy_sha = sha;
@@ -1448,12 +1453,15 @@ impl Volume {
             pos += take;
 
             // Free any old physical page mapped at `p_idx`.
+            // Free any old physical page mapped at `p_idx`.
             for ext in &extents {
-                if p_idx >= ext.file_page && p_idx < ext.end_page() && !ext.is_hole() {
-                    if let Ok(old_pid) = PageId::new(ext.page_id.get() + (p_idx - ext.file_page)) {
-                        self.alloc.free_page(old_pid);
-                        self.pages.remove(&old_pid);
-                    }
+                if p_idx >= ext.file_page
+                    && p_idx < ext.end_page()
+                    && !ext.is_hole()
+                    && let Ok(old_pid) = PageId::new(ext.page_id.get() + (p_idx - ext.file_page))
+                {
+                    self.alloc.free_page(old_pid);
+                    self.pages.remove(&old_pid);
                 }
             }
             let new_pid = self.alloc.allocate_one()?;

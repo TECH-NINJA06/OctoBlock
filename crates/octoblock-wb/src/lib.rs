@@ -2,10 +2,12 @@
 //!
 //! Connects `octoblock-fs::Volume` (`OBF1`) with the local encrypted write-ahead journal
 //! (`L1`), path-class routing (`persist`, `local`, `volatile`, `exclude`), op coalescing/elision,
-//! `.octoblock/status` observability, and `octopage-git::Transport` remote group commits (`L2`).
+//! writer leases and fencing (`refs/octopage/lease`), `.octoblock/status` observability, and
+//! `octopage-git::Transport` remote group commits (`L2`).
 
 pub mod coalesce;
 pub mod journal;
+pub mod lease;
 pub mod policy;
 
 use std::collections::BTreeMap;
@@ -27,6 +29,7 @@ use crate::coalesce::{AtomicRegion, coalesce_and_elide};
 use crate::journal::{
     DEFAULT_JOURNAL_CAPACITY, JournalEntry, JournalRecordType, LocalJournal, OnJournalFull,
 };
+use crate::lease::{LeaseManager, LeaseOutcome, LeasePolicy, LeaseRecord, MountRole};
 use crate::policy::PolicyEngine;
 
 /// Durability level reached by an operation (Section 1.5, Section 6.5).
@@ -64,7 +67,7 @@ pub enum MountState {
     Syncing,
     /// 8 consecutive lost races.
     Contended,
-    /// Lease lost or expired.
+    /// Lease lost or expired (`Section 7.2`, `EC-C04`). Writes are journaled locally, not pushed.
     Fenced,
     /// Network or GitHub unreachable.
     DegradedOffline,
@@ -96,6 +99,8 @@ pub struct LocalStateFile {
 pub struct StatusReport {
     /// Current mount state.
     pub state: MountState,
+    /// Active mount role (`writer`, `follower`, `multi_writer`).
+    pub role: MountRole,
     /// Active mount durability mode.
     pub mode: MountMode,
     /// Highest durability level guaranteed for `fsync` in this mode.
@@ -116,6 +121,8 @@ pub struct StatusReport {
     pub budget_soft: u64,
     /// Number of remote commits pushed during this session.
     pub remote_commits: u64,
+    /// Current writer lease holder and expiration (`None` if unleased).
+    pub lease: Option<LeaseRecord>,
 }
 
 /// `statfs` / `df` accounting structure (Section 8, Section 13.1).
@@ -142,6 +149,12 @@ pub struct EngineConfig {
     pub branch: String,
     /// Mount mode (`strict`, `balanced`, `relaxed`).
     pub mode: MountMode,
+    /// Writer lease policy (`required`, `advisory`, `off`).
+    pub lease_policy: LeasePolicy,
+    /// Explicitly mount as a read-only follower (`--follow`).
+    pub follow_only: bool,
+    /// Human-readable holder name for the writer lease.
+    pub holder_name: String,
     /// Group commit dirty-bytes trigger (`8 MiB` default, Appendix B).
     pub flush_bytes: u64,
     /// Backpressure dirty-bytes high-water mark (`64 MiB` default, Section 6.10).
@@ -152,7 +165,7 @@ pub struct EngineConfig {
     pub on_journal_full: OnJournalFull,
     /// Optional 32-byte master key for journal encryption (`REQ-8`).
     pub master_key: Option<[u8; 32]>,
-    /// Mount identifier for allocation group hashing.
+    /// Mount identifier for allocation group hashing and lease identity.
     pub mount_id: u64,
 }
 
@@ -161,6 +174,9 @@ impl Default for EngineConfig {
         EngineConfig {
             branch: "refs/heads/main".into(),
             mode: MountMode::Balanced,
+            lease_policy: LeasePolicy::Required,
+            follow_only: false,
+            holder_name: "octoblock-node".into(),
             flush_bytes: 8 * 1024 * 1024,
             high_water: 64 * 1024 * 1024,
             journal_capacity: DEFAULT_JOURNAL_CAPACITY,
@@ -175,6 +191,8 @@ impl Default for EngineConfig {
 pub struct WriteBackEngine<T: Transport> {
     transport: T,
     config: EngineConfig,
+    role: MountRole,
+    lease_mgr: LeaseManager,
     state_dir: PathBuf,
     local_sidecar_dir: PathBuf,
     state_file: LocalStateFile,
@@ -196,7 +214,7 @@ pub struct WriteBackEngine<T: Transport> {
 }
 
 impl<T: Transport> WriteBackEngine<T> {
-    /// Format a brand-new `OBF1` volume and push its initial commit to `transport`.
+    /// Format a brand-new `OBF1` volume, acquire the writer lease if configured, and push its initial commit.
     pub async fn mkfs(
         transport: T,
         state_dir: impl AsRef<Path>,
@@ -229,9 +247,21 @@ impl<T: Transport> WriteBackEngine<T> {
             config.on_journal_full,
         )?;
 
+        let mount_uuid = format!("mount-{:016x}", config.mount_id);
+        let mut lease_mgr = LeaseManager::new(&config.holder_name, mount_uuid, config.lease_policy);
+        if config.lease_policy == LeasePolicy::Required {
+            lease_mgr.acquire_or_renew(&transport).await?;
+        }
+        let role = match config.lease_policy {
+            LeasePolicy::Advisory => MountRole::MultiWriter,
+            _ => MountRole::Writer,
+        };
+
         let mut engine = WriteBackEngine {
             transport,
             config,
+            role,
+            lease_mgr,
             state_dir,
             local_sidecar_dir,
             state_file: LocalStateFile::default(),
@@ -248,12 +278,18 @@ impl<T: Transport> WriteBackEngine<T> {
             remote_commits: 0,
             next_seq: 1,
         };
-        engine.push_volume_state(b"{\"seq\":0,\"t\":0.0,\"op\":\"barrier\",\"kind\":\"group_end\"}\n", true).await?;
+        engine
+            .push_volume_state(
+                b"{\"seq\":0,\"t\":0.0,\"op\":\"barrier\",\"kind\":\"group_end\"}\n",
+                true,
+            )
+            .await?;
+        engine.save_state_file()?;
         Ok(engine)
     }
 
-    /// Mount an existing volume from `transport`, verifying anti-rollback (`REQ-5`) and replaying
-    /// any uncommitted records from the local journal (Section 6.9).
+    /// Mount an existing volume from `transport`, negotiating the writer lease (`Section 7.2`, `EC-C03`),
+    /// verifying anti-rollback (`REQ-5`), and replaying any uncommitted records from the local journal (`Section 6.9`).
     pub async fn mount(
         transport: T,
         state_dir: impl AsRef<Path>,
@@ -286,19 +322,39 @@ impl<T: Transport> WriteBackEngine<T> {
             .map(|r| r.id)
             .ok_or_else(|| Error::new(Errno::ENOENT, "volume branch not found on remote"))?;
 
+        // Negotiate writer lease / role (Section 7.1, 7.2, EC-C03).
+        let mount_uuid = format!("mount-{:016x}", config.mount_id);
+        let mut lease_mgr = LeaseManager::new(&config.holder_name, mount_uuid, config.lease_policy);
+        let mut role = if config.follow_only {
+            let _ = lease_mgr.fetch_remote_lease(&transport).await?;
+            MountRole::Follower
+        } else {
+            match config.lease_policy {
+                LeasePolicy::Required => match lease_mgr.acquire_or_renew(&transport).await? {
+                    LeaseOutcome::Acquired(_) => MountRole::Writer,
+                    // EC-C03: Another mount holds the live writer lease -> automatically become Follower!
+                    LeaseOutcome::HeldByOther(_) | LeaseOutcome::Fenced(_) => MountRole::Follower,
+                },
+                LeasePolicy::Advisory => MountRole::MultiWriter,
+                LeasePolicy::Off => MountRole::Writer,
+            }
+        };
+
         let (pages, policy) = Self::fetch_volume_from_remote(&transport, head).await?;
-        let mut vol = Volume::mount(pages, true, config.mount_id)?;
+        let mut vol = Volume::mount(pages, role != MountRole::Follower, config.mount_id)?;
 
         // Section 6.9 step 2 & Section 12.4 (REQ-5): Anti-rollback check.
         let mut mount_state = MountState::Online;
         if vol.superblock().epoch < state_file.highest_epoch {
             mount_state = MountState::Diverged;
+            role = MountRole::Follower;
         } else if let Some(last_hex) = &state_file.last_seen_head
             && let Ok(last_id) = ObjectId::from_hex(last_hex)
             && last_id != head
             && !Self::is_descendant(&transport, head, last_id).await?
         {
             mount_state = MountState::Diverged;
+            role = MountRole::Follower;
         }
 
         let (mut journal, recovered) = LocalJournal::open(
@@ -308,12 +364,12 @@ impl<T: Transport> WriteBackEngine<T> {
             config.on_journal_full,
         )?;
 
-        // Section 6.9 step 3: Replay only records that reached an L1 barrier or belong to the
-        // recovered journal prefix. If the remote head already advanced to cover the journal,
-        // truncate the journal; otherwise replay the journal entries onto `vol`.
         let mut replayed_ops = Vec::new();
         let mut ino_remap: BTreeMap<u64, u64> = BTreeMap::new();
-        if mount_state != MountState::Diverged && !recovered.is_empty() {
+        if mount_state != MountState::Diverged
+            && role != MountRole::Follower
+            && !recovered.is_empty()
+        {
             for entry in &recovered {
                 if entry.kind == JournalRecordType::Mutation {
                     Self::apply_recovered_entry(&mut vol, entry, &mut ino_remap)?;
@@ -327,6 +383,8 @@ impl<T: Transport> WriteBackEngine<T> {
         let mut engine = WriteBackEngine {
             transport,
             config,
+            role,
+            lease_mgr,
             state_dir,
             local_sidecar_dir,
             state_file,
@@ -349,6 +407,141 @@ impl<T: Transport> WriteBackEngine<T> {
         Ok(engine)
     }
 
+    // ------------------------------------------------------------------ Lease & Fencing Operations
+
+    /// Current mount role (`Writer`, `Follower`, `MultiWriter`).
+    pub const fn role(&self) -> MountRole {
+        self.role
+    }
+
+    /// Reference to the [`LeaseManager`].
+    pub const fn lease_manager(&self) -> &LeaseManager {
+        &self.lease_mgr
+    }
+
+    /// Mutable reference to the [`LeaseManager`] (for clock manipulation in tests).
+    pub fn lease_manager_mut(&mut self) -> &mut LeaseManager {
+        &mut self.lease_mgr
+    }
+
+    /// Renew or reacquire the writer lease (`Section 7.2`, `EC-C04`).
+    ///
+    /// If the lease was lost or expired, transitions the mount to [`MountState::Fenced`].
+    /// If the mount was [`MountState::Fenced`] and successfully reacquires the lease, checks
+    /// whether the remote head moved while fenced and rebases the local journal onto the new head!
+/// Renew or reacquire the writer lease (`Section 7.2`, `EC-C04`).
+    pub async fn renew_lease(&mut self) -> Result<MountState> {
+        if self.config.lease_policy != LeasePolicy::Required || self.role == MountRole::Follower {
+            return Ok(self.mount_state);
+        }
+        let was_fenced = self.mount_state == MountState::Fenced;
+        match self.lease_mgr.acquire_or_renew(&self.transport).await? {
+            LeaseOutcome::Acquired(_) => {
+                self.vol.set_read_only(false);
+                self.role = MountRole::Writer;
+                if was_fenced {
+                    self.reconcile_after_fencing().await?;
+                }
+                self.mount_state = if self.journal.depth_ops() > 0 {
+                    MountState::Syncing
+                } else {
+                    MountState::Online
+                };
+            }
+            LeaseOutcome::HeldByOther(_) | LeaseOutcome::Fenced(_) => {
+                self.mount_state = MountState::Fenced;
+                // Fenced mounts continue to allow local journal writes (L1), so ensure volume is writable:
+                self.vol.set_read_only(false);
+            }
+        }
+        Ok(self.mount_state)
+    }
+
+    async fn reconcile_after_fencing(&mut self) -> Result<()> {
+        let refs = self
+            .transport
+            .list_refs(&[&self.config.branch])
+            .await
+            .map_err(|e| Error::new(Errno::EIO, format!("list_refs: {e}")))?;
+        let Some(remote_head) = refs
+            .into_iter()
+            .find(|r| r.name == self.config.branch)
+            .map(|r| r.id)
+        else {
+            return Ok(());
+        };
+        if remote_head == self.head {
+            self.vol.set_read_only(false);
+            return Ok(());
+        }
+
+        // Verify anti-rollback before accepting the new head (REQ-5).
+        if !Self::is_descendant(&self.transport, remote_head, self.head).await? {
+            self.mount_state = MountState::Diverged;
+            self.role = MountRole::Follower;
+            return Err(Error::new(
+                Errno::EROFS,
+                "remote head diverged while mount was fenced (REQ-5)",
+            ));
+        }
+
+        let (pages, policy) = Self::fetch_volume_from_remote(&self.transport, remote_head).await?;
+        let mut new_vol = Volume::mount(pages, false, self.config.mount_id)?;
+        new_vol.set_read_only(false);
+        self.role = MountRole::Writer;
+
+        // Replay all uncommitted local journal entries onto `new_vol` (Section 6.9 step 5, Section 7.2).
+        let (reopened_journal, entries) = LocalJournal::open(
+            self.state_dir.join("journal"),
+            self.config.master_key.as_ref(),
+            self.config.journal_capacity,
+            self.config.on_journal_full,
+        )?;
+        self.journal = reopened_journal;
+        let mut ino_remap = BTreeMap::new();
+        let mut replayed_ops = Vec::new();
+        for entry in &entries {
+            if entry.kind == JournalRecordType::Mutation {
+                Self::apply_recovered_entry(&mut new_vol, entry, &mut ino_remap)?;
+                replayed_ops.push(entry.op.clone());
+            }
+        }
+        self.vol = new_vol;
+        self.policy = policy;
+        self.head = remote_head;
+        self.group_ops = replayed_ops;
+        self.save_state_file()?;
+        Ok(())
+    }
+    /// Force-break the writer lease on `refs/octopage/lease` (`octoblock lease break`, Section 7.2).
+    ///
+    /// Promotes a `Follower` or `Fenced` mount to active `Writer` and fences the previous holder.
+    pub async fn break_lease(&mut self) -> Result<LeaseRecord> {
+        let rec = self.lease_mgr.break_lease(&self.transport).await?;
+        let was_fenced_or_follower =
+            self.mount_state == MountState::Fenced || self.role == MountRole::Follower;
+        self.role = MountRole::Writer;
+        if was_fenced_or_follower {
+            self.reconcile_after_fencing().await?;
+        }
+        self.mount_state = if self.journal.depth_ops() > 0 {
+            MountState::Syncing
+        } else {
+            MountState::Online
+        };
+        Ok(rec)
+    }
+
+    /// Release the writer lease cleanly on unmount (`octoblock umount`).
+    pub async fn unmount(&mut self) -> Result<()> {
+        if self.role != MountRole::Follower && self.mount_state != MountState::Fenced {
+            let _ = self.sync_remote().await;
+        }
+        self.lease_mgr.release(&self.transport).await
+    }
+
+    /// When a fenced mount reacquires the lease, check if the remote head moved while it was
+    /// fenced; if so, fetch the new head and replay the local journal on top of it (`Section 7.2`, `EC-C04`).
     async fn is_descendant(transport: &T, tip: ObjectId, ancestor: ObjectId) -> Result<bool> {
         if tip == ancestor {
             return Ok(true);
@@ -602,6 +795,13 @@ impl<T: Transport> WriteBackEngine<T> {
     // ------------------------------------------------------------------ Path resolution & Policy routing
 
     fn check_writable(&self, non_blocking: bool) -> Result<()> {
+        // Only strict Follower mounts are read-only. Fenced mounts are permitted to write locally (L1).
+        if self.role == MountRole::Follower && self.mount_state != MountState::Fenced {
+            return Err(Error::new(
+                Errno::EROFS,
+                "follower mount is read-only (Section 7.1)",
+            ));
+        }
         if self.mount_state == MountState::Diverged {
             return Err(Error::new(Errno::EROFS, "volume is in DIVERGED state"));
         }
@@ -647,7 +847,13 @@ impl<T: Transport> WriteBackEngine<T> {
     fn sidecar_file_path(&self, full_path: &str) -> PathBuf {
         let safe: String = full_path
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.local_sidecar_dir.join(safe)
     }
@@ -676,7 +882,8 @@ impl<T: Transport> WriteBackEngine<T> {
                     ino,
                     target: None,
                 });
-                self.journal.append(JournalRecordType::Mutation, op, Vec::new())?;
+                self.journal
+                    .append(JournalRecordType::Mutation, op, Vec::new())?;
                 self.dirty_bytes += 128;
             }
             PathClass::Local => {
@@ -712,7 +919,8 @@ impl<T: Transport> WriteBackEngine<T> {
                 ino,
                 target: None,
             });
-            self.journal.append(JournalRecordType::Mutation, op, Vec::new())?;
+            self.journal
+                .append(JournalRecordType::Mutation, op, Vec::new())?;
             self.dirty_bytes += 128;
         }
         self.update_journal_health();
@@ -763,7 +971,8 @@ impl<T: Transport> WriteBackEngine<T> {
                 parent: new_parent,
                 name: String::from_utf8_lossy(&new_name).into_owned(),
             });
-            self.journal.append(JournalRecordType::Mutation, op, Vec::new())?;
+            self.journal
+                .append(JournalRecordType::Mutation, op, Vec::new())?;
         }
         Ok(())
     }
@@ -878,7 +1087,8 @@ impl<T: Transport> WriteBackEngine<T> {
                     size: new_size,
                     mode: 0,
                 });
-                self.journal.append(JournalRecordType::Mutation, op, Vec::new())?;
+                self.journal
+                    .append(JournalRecordType::Mutation, op, Vec::new())?;
                 Ok(())
             }
             PathClass::Local => {
@@ -911,7 +1121,8 @@ impl<T: Transport> WriteBackEngine<T> {
                     name: String::from_utf8_lossy(&name).into_owned(),
                     ino,
                 });
-                self.journal.append(JournalRecordType::Mutation, op, Vec::new())?;
+                self.journal
+                    .append(JournalRecordType::Mutation, op, Vec::new())?;
             }
             PathClass::Local => {
                 let _ = fs::remove_file(self.sidecar_file_path(&full));
@@ -938,7 +1149,8 @@ impl<T: Transport> WriteBackEngine<T> {
                 name: String::from_utf8_lossy(&name).into_owned(),
                 ino,
             });
-            self.journal.append(JournalRecordType::Mutation, op, Vec::new())?;
+            self.journal
+                .append(JournalRecordType::Mutation, op, Vec::new())?;
         }
         Ok(())
     }
@@ -966,7 +1178,8 @@ impl<T: Transport> WriteBackEngine<T> {
                     new: (new_parent, String::from_utf8_lossy(&new_name).into_owned()),
                     flags,
                 });
-                self.journal.append(JournalRecordType::Mutation, op, Vec::new())?;
+                self.journal
+                    .append(JournalRecordType::Mutation, op, Vec::new())?;
             }
             PathClass::Local => {
                 let _ = fs::rename(
@@ -1002,7 +1215,8 @@ impl<T: Transport> WriteBackEngine<T> {
         let op = self.record_op(OpKind::Barrier {
             kind: "atomic_begin".into(),
         });
-        self.journal.append(JournalRecordType::Barrier, op, Vec::new())?;
+        self.journal
+            .append(JournalRecordType::Barrier, op, Vec::new())?;
         Ok(())
     }
 
@@ -1012,7 +1226,8 @@ impl<T: Transport> WriteBackEngine<T> {
         let op = self.record_op(OpKind::Barrier {
             kind: "atomic_end".into(),
         });
-        self.journal.append(JournalRecordType::Barrier, op, Vec::new())?;
+        self.journal
+            .append(JournalRecordType::Barrier, op, Vec::new())?;
         self.journal.barrier()?;
         self.sync_remote().await
     }
@@ -1040,6 +1255,9 @@ impl<T: Transport> WriteBackEngine<T> {
 
     /// Force an `L2` group commit to the remote repository (`octoblock sync`, Section 6.7).
     pub async fn sync_remote(&mut self) -> Result<()> {
+        if self.role == MountRole::Follower {
+            return Err(Error::new(Errno::EROFS, "follower mount cannot push"));
+        }
         if self.atomic.active {
             // REQ-3: No commit group may be split inside an atomic region.
             return Ok(());
@@ -1047,6 +1265,16 @@ impl<T: Transport> WriteBackEngine<T> {
         // REQ-11: Empty groups MUST NOT be committed.
         if self.group_ops.is_empty() && self.journal.depth_ops() == 0 {
             return Ok(());
+        }
+
+        // Section 7.2: Verify or reacquire the writer lease before pushing when `--lease required`.
+        if self.config.lease_policy == LeasePolicy::Required {
+            self.renew_lease().await?;
+            if self.mount_state == MountState::Fenced {
+                // Fenced mounts MUST NOT push to the remote; ops stay safely in the local journal.
+                self.journal.barrier()?;
+                return Ok(());
+            }
         }
 
         let coalesced = coalesce_and_elide(&self.group_ops);
@@ -1062,14 +1290,16 @@ impl<T: Transport> WriteBackEngine<T> {
     }
 
     async fn push_volume_state(&mut self, changelog_bytes: &[u8], initial: bool) -> Result<()> {
-        // If a previous attempt returned PushOutcomeUnknown, check if that deterministic commit landed!
         if let Some((unknown_commit, _)) = self.pending_unknown_commit {
             let refs = self
                 .transport
                 .list_refs(&[&self.config.branch])
                 .await
                 .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
-            if refs.iter().any(|r| r.name == self.config.branch && r.id == unknown_commit) {
+            if refs
+                .iter()
+                .any(|r| r.name == self.config.branch && r.id == unknown_commit)
+            {
                 self.head = unknown_commit;
                 self.pending_unknown_commit = None;
                 self.remote_commits += 1;
@@ -1082,8 +1312,8 @@ impl<T: Transport> WriteBackEngine<T> {
         let mut by_a: BTreeMap<u8, BTreeMap<u8, Vec<(u8, ObjectId)>>> = BTreeMap::new();
 
         for (pid, raw_bytes) in pages {
-            let blob = Object::blob(raw_bytes)
-                .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+            let blob =
+                Object::blob(raw_bytes).map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
             let [a, b, c] = pid.bytes();
             by_a.entry(a)
                 .or_default()
@@ -1174,7 +1404,11 @@ impl<T: Transport> WriteBackEngine<T> {
         };
 
         for _attempt in 0..4 {
-            match self.transport.push(std::slice::from_ref(&ref_update), &new_objects).await {
+            match self
+                .transport
+                .push(std::slice::from_ref(&ref_update), &new_objects)
+                .await
+            {
                 Ok(()) => {
                     self.head = commit_id;
                     self.pending_unknown_commit = None;
@@ -1182,21 +1416,21 @@ impl<T: Transport> WriteBackEngine<T> {
                     return Ok(());
                 }
                 Err(octopage_git::Error::PushOutcomeUnknown(_)) => {
-                    // Deterministic commit SHA check (Section 6.5 & Section 11.1):
-                    // Read the head ref to see if our commit actually landed despite the lost response!
                     self.pending_unknown_commit = Some((commit_id, epoch));
                     let refs = self
                         .transport
                         .list_refs(&[&self.config.branch])
                         .await
                         .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
-                    if refs.iter().any(|r| r.name == self.config.branch && r.id == commit_id) {
+                    if refs
+                        .iter()
+                        .any(|r| r.name == self.config.branch && r.id == commit_id)
+                    {
                         self.head = commit_id;
                         self.pending_unknown_commit = None;
                         self.remote_commits += 1;
                         return Ok(());
                     }
-                    // Otherwise retry sending the exact same deterministic commit.
                 }
                 Err(octopage_git::Error::RateLimited { .. }) => {
                     self.mount_state = MountState::DegradedOffline;
@@ -1229,6 +1463,9 @@ impl<T: Transport> WriteBackEngine<T> {
     }
 
     fn update_journal_health(&mut self) {
+        if self.mount_state == MountState::Fenced {
+            return;
+        }
         if self.journal.is_above_90_percent() {
             self.mount_state = MountState::DegradedJournal;
         } else if self.journal.depth_ops() > 0 && self.mount_state == MountState::Online {
@@ -1246,6 +1483,7 @@ impl<T: Transport> WriteBackEngine<T> {
         };
         StatusReport {
             state: self.mount_state,
+            role: self.role,
             mode: self.config.mode,
             fsync_durability,
             journal_depth_ops: self.journal.depth_ops(),
@@ -1256,6 +1494,7 @@ impl<T: Transport> WriteBackEngine<T> {
             live_bytes: sb.live_bytes,
             budget_soft: octoblock_fs::DEFAULT_BUDGET_SOFT,
             remote_commits: self.remote_commits,
+            lease: self.lease_mgr.known_lease().cloned(),
         }
     }
 
@@ -1284,13 +1523,13 @@ impl<T: Transport> WriteBackEngine<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use octoblock_fs::{RENAME_EXCHANGE, RENAME_NOREPLACE};
     use octopage_git::{Fault, InMemory};
-    use std::sync::Arc;
 
     #[tokio::test]
     async fn phase_c_pjdfstest_supported_set_and_policy_classes() {
-        let remote = InMemory::new();
+        let remote = Arc::new(InMemory::new());
         let dir = tempfile::tempdir().unwrap();
         let cfg = EngineConfig {
             master_key: Some([0x33; 32]),
@@ -1313,25 +1552,38 @@ mod tests {
         engine.write("/tmp/sock.tmp", 0, b"ram-only").unwrap();
         assert_eq!(engine.read("/tmp/sock.tmp", 0, 64).unwrap(), b"ram-only");
         // EC-L05: volatile fsync returns L0 no-op success
-        assert_eq!(engine.fsync("/tmp/sock.tmp").await.unwrap(), DurabilityLevel::L0);
+        assert_eq!(
+            engine.fsync("/tmp/sock.tmp").await.unwrap(),
+            DurabilityLevel::L0
+        );
 
         engine.mkdir("/etc", 0o755, 0, 0).unwrap();
         engine.create("/etc/hosts", 0o644, 0, 0).unwrap();
-        engine.write("/etc/hosts", 0, b"127.0.0.1 localhost\n").unwrap();
+        engine
+            .write("/etc/hosts", 0, b"127.0.0.1 localhost\n")
+            .unwrap();
 
         // REQ-10: Cross-class rename or link returns EXDEV
         assert_eq!(
-            engine.rename("/tmp/sock.tmp", "/etc/sock.tmp", 0).unwrap_err().errno,
+            engine
+                .rename("/tmp/sock.tmp", "/etc/sock.tmp", 0)
+                .unwrap_err()
+                .errno,
             Errno::EXDEV
         );
         assert_eq!(
-            engine.link("/tmp/sock.tmp", "/etc/sock.tmp").unwrap_err().errno,
+            engine
+                .link("/tmp/sock.tmp", "/etc/sock.tmp")
+                .unwrap_err()
+                .errno,
             Errno::EXDEV
         );
 
-        // 2. pjdfstest renameat2 conformance: RENAME_NOREPLACE, RENAME_EXCHANGE, ENOTEMPTY, EINVAL loop
+        // 2. pjdfstest renameat2 conformance: RENAME_NOREPLACE, RENAME_EXCHANGE, ENOTEMPTY
         engine.create("/etc/hosts.new", 0o644, 0, 0).unwrap();
-        engine.write("/etc/hosts.new", 0, b"::1 localhost\n").unwrap();
+        engine
+            .write("/etc/hosts.new", 0, b"::1 localhost\n")
+            .unwrap();
         assert_eq!(
             engine
                 .rename("/etc/hosts.new", "/etc/hosts", RENAME_NOREPLACE)
@@ -1342,7 +1594,10 @@ mod tests {
         engine
             .rename("/etc/hosts.new", "/etc/hosts", RENAME_EXCHANGE)
             .unwrap();
-        assert_eq!(engine.read("/etc/hosts", 0, 64).unwrap(), b"::1 localhost\n");
+        assert_eq!(
+            engine.read("/etc/hosts", 0, 64).unwrap(),
+            b"::1 localhost\n"
+        );
         assert_eq!(
             engine.read("/etc/hosts.new", 0, 64).unwrap(),
             b"127.0.0.1 localhost\n"
@@ -1353,6 +1608,7 @@ mod tests {
         let status_bytes = engine.read("/.octoblock/status", 0, 4096).unwrap();
         let status: StatusReport = serde_json::from_slice(&status_bytes).unwrap();
         assert_eq!(status.mode, MountMode::Balanced);
+        assert_eq!(status.role, MountRole::Writer);
         assert_eq!(status.fsync_durability, DurabilityLevel::L1);
         assert!(status.journal_depth_ops > 0);
 
@@ -1385,11 +1641,8 @@ mod tests {
         .unwrap();
 
         let mut rng = fastrand::Rng::with_seed(0x5000_C0DE);
-        // Track all files acknowledged at L1 (journal barrier) or L2 (remote commit)
         let mut durable_files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
-        // (0) Journal append + L1 barrier, (1) Torn journal tail crash, (2) Push DropBeforeApply,
-        // (3) Push DropAfterApply (lost ack settled by deterministic commit SHA), (4) Clean L2 sync + remount.
         for point in 0..5_000 {
             let path = format!("/file_{}.bin", point % 64);
             let payload = vec![(point & 0xFF) as u8; 128 + (point % 512)];
@@ -1400,14 +1653,12 @@ mod tests {
                 engine.truncate(&path, 0).unwrap();
             }
             engine.write(&path, 0, &payload).unwrap();
-            // Balanced fsync -> L1 journal barrier completed: MUST survive any crash!
             let lvl = engine.fsync(&path).await.unwrap();
             assert_eq!(lvl, DurabilityLevel::L1);
             durable_files.insert(path.clone(), payload);
 
             match point % 25 {
                 5 => {
-                    // Inject a torn tail record onto the active journal segment, then crash and remount!
                     let seg = engine.journal.active_segment_path();
                     if let Ok(mut f) = fs::OpenOptions::new().append(true).open(&seg) {
                         use std::io::Write;
@@ -1419,17 +1670,14 @@ mod tests {
                         .unwrap();
                 }
                 10 => {
-                    // Inject network drop BEFORE apply on remote push; sync_remote settles and retries
                     remote.inject(Fault::DropBeforeApply);
                     engine.sync_remote().await.unwrap();
                 }
                 15 => {
-                    // Inject lost response AFTER remote push applied; deterministic SHA settles it!
                     remote.inject(Fault::DropAfterApply);
                     engine.sync_remote().await.unwrap();
                 }
                 20 => {
-                    // Clean L2 commit followed by daemon crash & remount
                     engine.sync_remote().await.unwrap();
                     drop(engine);
                     engine = WriteBackEngine::mount(remote.clone(), dir.path(), cfg.clone())
@@ -1442,14 +1690,147 @@ mod tests {
             }
         }
 
-        // Final verification after 5,000 crash points: zero lost L1/L2 writes!
         engine.sync_remote().await.unwrap();
-        let remounted = WriteBackEngine::mount(remote, dir.path(), cfg).await.unwrap();
+        let remounted = WriteBackEngine::mount(remote, dir.path(), cfg)
+            .await
+            .unwrap();
         for (path, expected_bytes) in &durable_files {
             let got = remounted
                 .read(path, 0, expected_bytes.len() + 64)
                 .unwrap();
-            assert_eq!(&got, expected_bytes, "lost or corrupted L1/L2 data at {path}");
+            assert_eq!(
+                &got, expected_bytes,
+                "lost or corrupted L1/L2 data at {path}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn phase_d_writer_lease_cas_and_follower_demotion() {
+        let remote = Arc::new(InMemory::new());
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+
+        let cfg1 = EngineConfig {
+            mount_id: 101,
+            holder_name: "writer-node-1".into(),
+            ..EngineConfig::default()
+        };
+        let cfg2 = EngineConfig {
+            mount_id: 202,
+            holder_name: "writer-node-2".into(),
+            ..EngineConfig::default()
+        };
+
+        // Mount 1 formats and acquires the writer lease on refs/octopage/lease.
+        let mut m1 = WriteBackEngine::mkfs(
+            remote.clone(),
+            dir1.path(),
+            cfg1,
+            4096,
+            CasePolicy::Sensitive,
+            PolicyEngine::tier0_default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(m1.role(), MountRole::Writer);
+        m1.create("/hello.txt", 0o644, 1000, 1000).unwrap();
+        m1.write("/hello.txt", 0, b"from-m1").unwrap();
+        m1.sync_remote().await.unwrap();
+
+        // EC-C03: Mount 2 mounts the same branch while Mount 1's lease is live -> demoted to Follower (EROFS).
+        let mut m2 = WriteBackEngine::mount(remote.clone(), dir2.path(), cfg2.clone())
+            .await
+            .unwrap();
+        assert_eq!(m2.role(), MountRole::Follower);
+        assert_eq!(m2.read("/hello.txt", 0, 64).unwrap(), b"from-m1");
+        assert_eq!(
+            m2.create("/illegal.txt", 0o644, 1000, 1000)
+                .unwrap_err()
+                .errno,
+            Errno::EROFS
+        );
+
+        // When Mount 1 cleanly unmounts and releases the lease, a new mount takes the Writer role.
+        m1.unmount().await.unwrap();
+        let mut m2_writer = WriteBackEngine::mount(remote, dir2.path(), cfg2)
+            .await
+            .unwrap();
+        assert_eq!(m2_writer.role(), MountRole::Writer);
+        m2_writer.write("/hello.txt", 0, b"from-m2").unwrap();
+        m2_writer.sync_remote().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn phase_d_fencing_on_expiry_and_lease_break_rebase() {
+        let remote = Arc::new(InMemory::new());
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+
+        let cfg1 = EngineConfig {
+            mount_id: 1,
+            holder_name: "laptop-1".into(),
+            ..EngineConfig::default()
+        };
+        let cfg2 = EngineConfig {
+            mount_id: 2,
+            holder_name: "workstation-2".into(),
+            ..EngineConfig::default()
+        };
+
+        let mut m1 = WriteBackEngine::mkfs(
+            remote.clone(),
+            dir1.path(),
+            cfg1,
+            4096,
+            CasePolicy::Sensitive,
+            PolicyEngine::tier0_default(),
+        )
+        .await
+        .unwrap();
+
+        // Mount 2 starts as Follower, then forces a lease takeover (`octoblock lease break`, Section 7.2).
+        let mut m2 = WriteBackEngine::mount(remote.clone(), dir2.path(), cfg2)
+            .await
+            .unwrap();
+        assert_eq!(m2.role(), MountRole::Follower);
+        m2.break_lease().await.unwrap();
+        assert_eq!(m2.role(), MountRole::Writer);
+
+        // Mount 2 writes and commits `/from_m2.txt` to the remote while Mount 1 is unaware.
+        m2.create("/from_m2.txt", 0o644, 1000, 1000).unwrap();
+        m2.write("/from_m2.txt", 0, b"committed-by-m2").unwrap();
+        m2.sync_remote().await.unwrap();
+
+        // EC-C04: Mount 1 tries to renew or sync -> discovers it lost the lease and becomes FENCED!
+        // While FENCED, Mount 1 continues journaling writes locally (`L1`) without pushing.
+        assert_eq!(m1.renew_lease().await.unwrap(), MountState::Fenced);
+        m1.create("/from_m1_fenced.txt", 0o644, 1000, 1000).unwrap();
+        m1.write("/from_m1_fenced.txt", 0, b"journaled-while-fenced")
+            .unwrap();
+        assert_eq!(
+            m1.fsync("/from_m1_fenced.txt").await.unwrap(),
+            DurabilityLevel::L1
+        );
+        // sync_remote on a FENCED mount keeps ops in the journal and does not push.
+        m1.sync_remote().await.unwrap();
+        assert_eq!(m1.status().state, MountState::Fenced);
+        assert!(m1.status().journal_depth_ops > 0);
+
+        // Now Mount 2 releases its lease, and Mount 1 reacquires the lease!
+        // Mount 1 detects the head moved, fetches `/from_m2.txt`, replays `/from_m1_fenced.txt`
+        // on top of the new head, and pushes both to the remote (`Section 7.2`, `EC-C04`).
+        m2.unmount().await.unwrap();
+        assert_eq!(m1.renew_lease().await.unwrap(), MountState::Syncing);
+        m1.sync_remote().await.unwrap();
+        assert_eq!(m1.status().state, MountState::Online);
+        assert_eq!(
+            m1.read("/from_m2.txt", 0, 64).unwrap(),
+            b"committed-by-m2"
+        );
+        assert_eq!(
+            m1.read("/from_m1_fenced.txt", 0, 64).unwrap(),
+            b"journaled-while-fenced"
+        );
     }
 }

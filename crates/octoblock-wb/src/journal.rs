@@ -158,6 +158,7 @@ impl LocalJournal {
         // `FILE_WRITE_DATA`, which is required by `File::set_len(0)` during `truncate_committed`.
         let mut active_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&active_path)

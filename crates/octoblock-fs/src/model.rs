@@ -232,9 +232,17 @@ impl RefModel {
     }
 
     /// Assert that `vol` matches `self` on every directory, inode, file byte, and xattr.
+    /// Assert that `vol` matches `self` on every directory, inode, file byte, and xattr.
     pub fn assert_matches(&self, vol: &Volume) -> Result<()> {
         for (&ino, ref_node) in &self.inodes {
             let rec = vol.getattr(ino)?;
+            assert_eq!(rec.uid, ref_node.uid, "uid mismatch on ino {ino}");
+            assert_eq!(rec.gid, ref_node.gid, "gid mismatch on ino {ino}");
+            assert_eq!(
+                rec.nlink, ref_node.nlink,
+                "nlink mismatch on ino {ino}: vol={} ref={}",
+                rec.nlink, ref_node.nlink
+            );
             assert_eq!(
                 rec.nlink, ref_node.nlink,
                 "nlink mismatch on ino {ino}: vol={} ref={}",
