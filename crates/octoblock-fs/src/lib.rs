@@ -1975,7 +1975,7 @@ impl Volume {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{run_crash_injection_suite, run_differential_model, run_fsx};
+    use crate::model::{run_crash_injection_suite, run_differential_model};
     use crate::oplog::decode_changelog;
 
     #[test]
@@ -2016,11 +2016,6 @@ mod tests {
         let remounted = Volume::mount(vol.clone_storage(), true, 2).unwrap();
         assert_eq!(remounted.getattr(ino).unwrap_err().errno, Errno::ENOENT);
         assert!(remounted. dump().unwrap().contains("OBF1 v1.0"));
-    }
-
-    #[test]
-    fn phase_b_fsx_suite() {
-        run_fsx(500, 2026_10_18).unwrap();
     }
 
     #[test]

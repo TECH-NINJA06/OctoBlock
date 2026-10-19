@@ -5,7 +5,9 @@
 //! writer leases and fencing (`refs/octopage/lease`), `.octoblock/status` observability, and
 //! `octopage-git::Transport` remote group commits (`L2`).
 
+pub mod branch;
 pub mod coalesce;
+pub mod conflict;
 pub mod journal;
 pub mod lease;
 pub mod policy;
