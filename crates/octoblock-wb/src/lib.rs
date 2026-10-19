@@ -27,6 +27,14 @@ use octopage_git::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::branch::{
+    AsOfSelector, OpenFileTable, RefInfo, create_branch, create_snapshot, encode_snapshot_ino,
+    list_branches, list_snapshots, resolve_as_of,
+};
+use crate::conflict::{
+    ConflictLog, ConflictReason, ConflictRecord, MAX_CONSECUTIVE_RACES, RemoteDiffSummary,
+};
+
 use crate::coalesce::{AtomicRegion, coalesce_and_elide};
 use crate::journal::{
     DEFAULT_JOURNAL_CAPACITY, JournalEntry, JournalRecordType, LocalJournal, OnJournalFull,
@@ -213,6 +221,11 @@ pub struct WriteBackEngine<T: Transport> {
     pending_unknown_commit: Option<(ObjectId, u64)>,
     remote_commits: u64,
     next_seq: u64,
+    conflicts: ConflictLog,
+    consecutive_races: u32,
+    open_files: OpenFileTable,
+    snapshot_cache: BTreeMap<ObjectId, (u16, Volume)>,
+    next_snapshot_slot: u16,
 }
 
 impl<T: Transport> WriteBackEngine<T> {
@@ -279,6 +292,11 @@ impl<T: Transport> WriteBackEngine<T> {
             pending_unknown_commit: None,
             remote_commits: 0,
             next_seq: 1,
+            conflicts: ConflictLog::default(),
+            consecutive_races: 0,
+            open_files: OpenFileTable::default(),
+            snapshot_cache: BTreeMap::new(),
+            next_snapshot_slot: 1,
         };
         engine
             .push_volume_state(
@@ -343,7 +361,7 @@ impl<T: Transport> WriteBackEngine<T> {
         };
 
         let (pages, policy) = Self::fetch_volume_from_remote(&transport, head).await?;
-        let mut vol = Volume::mount(pages, role != MountRole::Follower, config.mount_id)?;
+        let mut vol = Volume::mount(pages, true, config.mount_id)?;
 
         // Section 6.9 step 2 & Section 12.4 (REQ-5): Anti-rollback check.
         let mut mount_state = MountState::Online;
@@ -402,6 +420,11 @@ impl<T: Transport> WriteBackEngine<T> {
             pending_unknown_commit: None,
             remote_commits: 0,
             next_seq: 1,
+            conflicts: ConflictLog::default(),
+            consecutive_races: 0,
+            open_files: OpenFileTable::default(),
+            snapshot_cache: BTreeMap::new(),
+            next_snapshot_slot: 1,
         };
         if engine.mount_state != MountState::Diverged {
             engine.save_state_file()?;
@@ -473,11 +496,9 @@ impl<T: Transport> WriteBackEngine<T> {
             return Ok(());
         };
         if remote_head == self.head {
-            self.vol.set_read_only(false);
             return Ok(());
         }
 
-        // Verify anti-rollback before accepting the new head (REQ-5).
         if !Self::is_descendant(&self.transport, remote_head, self.head).await? {
             self.mount_state = MountState::Diverged;
             self.role = MountRole::Follower;
@@ -487,12 +508,14 @@ impl<T: Transport> WriteBackEngine<T> {
             ));
         }
 
+        let remote_diff =
+            Self::collect_remote_diff(&self.transport, remote_head, self.head).await?;
         let (pages, policy) = Self::fetch_volume_from_remote(&self.transport, remote_head).await?;
-        let mut new_vol = Volume::mount(pages, false, self.config.mount_id)?;
-        new_vol.set_read_only(false);
-        self.role = MountRole::Writer;
+        let mut new_vol = Volume::mount(pages, true, self.config.mount_id)?;
+        if self.config.lease_policy == LeasePolicy::Required {
+            self.role = MountRole::Writer;
+        }
 
-        // Replay all uncommitted local journal entries onto `new_vol` (Section 6.9 step 5, Section 7.2).
         let (reopened_journal, entries) = LocalJournal::open(
             self.state_dir.join("journal"),
             self.config.master_key.as_ref(),
@@ -501,10 +524,30 @@ impl<T: Transport> WriteBackEngine<T> {
         )?;
         self.journal = reopened_journal;
         let mut ino_remap = BTreeMap::new();
+        let mut ino_paths: BTreeMap<u64, String> = BTreeMap::from([(ROOT_INO, String::new())]);
+        let mut conflicted_inodes: BTreeMap<u64, (u64, String)> = BTreeMap::new();
         let mut replayed_ops = Vec::new();
+        let base_hex = self.head.to_hex();
+        let remote_hex = remote_head.to_hex();
+        let batch_id = format!(
+            "epoch-{}-mount-{}",
+            new_vol.superblock().epoch,
+            self.config.mount_id
+        );
+
         for entry in &entries {
             if entry.kind == JournalRecordType::Mutation {
-                Self::apply_recovered_entry(&mut new_vol, entry, &mut ino_remap)?;
+                self.replay_entry_with_conflict_detection(
+                    &mut new_vol,
+                    entry,
+                    &remote_diff,
+                    &mut ino_remap,
+                    &mut ino_paths,
+                    &mut conflicted_inodes,
+                    &batch_id,
+                    &base_hex,
+                    &remote_hex,
+                )?;
                 replayed_ops.push(entry.op.clone());
             }
         }
@@ -514,6 +557,491 @@ impl<T: Transport> WriteBackEngine<T> {
         self.group_ops = replayed_ops;
         self.save_state_file()?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replay_entry_with_conflict_detection(
+        &mut self,
+        vol: &mut Volume,
+        entry: &JournalEntry,
+        remote_diff: &RemoteDiffSummary,
+        ino_remap: &mut BTreeMap<u64, u64>,
+        ino_paths: &mut BTreeMap<u64, String>,
+        conflicted_inodes: &mut BTreeMap<u64, (u64, String)>,
+        batch_id: &str,
+        base_hex: &str,
+        remote_hex: &str,
+    ) -> Result<()> {
+        let map_ino = |m: &BTreeMap<u64, u64>, ino: u64| m.get(&ino).copied().unwrap_or(ino);
+        match &entry.op.kind {
+            OpKind::Create {
+                op_name,
+                parent,
+                name,
+                mode,
+                ino: recorded_ino,
+                ..
+            } => {
+                let p_ino = map_ino(ino_remap, *parent);
+                let parent_path = ino_paths.get(&p_ino).cloned().unwrap_or_default();
+                let full_path = format!("{parent_path}/{name}");
+                ino_paths.insert(*recorded_ino, full_path.clone());
+
+                if remote_diff.created_names.contains(&(p_ino, name.clone()))
+                    && op_name == "create"
+                {
+                    let conflict_name =
+                        format!("{name}.conflict-{}-{}", self.config.mount_id, entry.seq);
+                    let conflict_full = format!("{parent_path}/{conflict_name}");
+                    let c_ino = vol.create(
+                        p_ino,
+                        conflict_name.as_bytes(),
+                        *mode,
+                        entry.op.uid,
+                        entry.op.gid,
+                    )?;
+                    ino_remap.insert(*recorded_ino, c_ino);
+                    conflicted_inodes.insert(*recorded_ino, (c_ino, conflict_full.clone()));
+                    self.conflicts.push(ConflictRecord {
+                        batch_id: batch_id.to_string(),
+                        seq: entry.seq,
+                        base_commit: base_hex.to_string(),
+                        remote_commit: remote_hex.to_string(),
+                        path: full_path,
+                        preserved_copy: Some(conflict_full),
+                        reason: ConflictReason::CreateCollision,
+                    });
+                    return Ok(());
+                }
+
+                Self::apply_recovered_entry(vol, entry, ino_remap)?;
+                if let Some(&actual) = ino_remap.get(recorded_ino) {
+                    ino_paths.insert(actual, full_path);
+                }
+            }
+            OpKind::Write { ino, off, .. } => {
+                if let Some(&(c_ino, _)) = conflicted_inodes.get(ino) {
+                    let _ = vol.write(c_ino, *off, &entry.data);
+                    return Ok(());
+                }
+                let t_ino = map_ino(ino_remap, *ino);
+                let path = ino_paths
+                    .get(&t_ino)
+                    .cloned()
+                    .unwrap_or_else(|| format!("/ino-{t_ino}"));
+
+                let exists_on_remote = vol.getattr(t_ino).is_ok();
+                if !exists_on_remote || remote_diff.modified_inodes.contains(&t_ino) {
+                    let conflict_name =
+                        format!("ino-{t_ino}.conflict-{}-{}", self.config.mount_id, entry.seq);
+                    let conflict_path = format!("/{conflict_name}");
+                    let c_ino = match vol.lookup(ROOT_INO, conflict_name.as_bytes()) {
+                        Ok(existing) => existing,
+                        Err(_) => vol.create(
+                            ROOT_INO,
+                            conflict_name.as_bytes(),
+                            0o644,
+                            entry.op.uid,
+                            entry.op.gid,
+                        )?,
+                    };
+                    let _ = vol.write(c_ino, *off, &entry.data);
+                    conflicted_inodes.insert(*ino, (c_ino, conflict_path.clone()));
+                    self.conflicts.push(ConflictRecord {
+                        batch_id: batch_id.to_string(),
+                        seq: entry.seq,
+                        base_commit: base_hex.to_string(),
+                        remote_commit: remote_hex.to_string(),
+                        path,
+                        preserved_copy: Some(conflict_path),
+                        reason: if exists_on_remote {
+                            ConflictReason::ConcurrentModify
+                        } else {
+                            ConflictReason::ModifyDeleted
+                        },
+                    });
+                    return Ok(());
+                }
+                Self::apply_recovered_entry(vol, entry, ino_remap)?;
+            }
+            _ => {
+                Self::apply_recovered_entry(vol, entry, ino_remap)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn collect_remote_diff(
+        transport: &T,
+        remote_head: ObjectId,
+        base_head: ObjectId,
+    ) -> Result<RemoteDiffSummary> {
+        let mut summary = RemoteDiffSummary::default();
+        let commits = transport
+            .history(remote_head, Some(base_head), false)
+            .await
+            .map_err(|e| Error::new(Errno::EIO, format!("history: {e}")))?;
+
+        for obj in commits {
+            if obj.kind() != ObjectKind::Commit {
+                continue;
+            }
+            let Ok(commit) = Commit::decode(obj.data()) else {
+                continue;
+            };
+            let Ok(root_objs) = transport.fetch(&[commit.tree]).await else {
+                continue;
+            };
+            let Ok(root_tree) = Tree::decode(root_objs[0].data()) else {
+                continue;
+            };
+            if let Some(cl_entry) = root_tree.get(b"changelog")
+                && let Ok(cl_objs) = transport.fetch(&[cl_entry.id]).await
+            {
+                summary.absorb_changelog(cl_objs[0].data());
+            }
+        }
+        Ok(summary)
+    }
+
+    pub const fn conflicts(&self) -> &ConflictLog {
+        &self.conflicts
+    }
+
+    pub const fn head_commit(&self) -> ObjectId {
+        self.head
+    }
+
+    pub async fn mount_as_of(
+        transport: T,
+        state_dir: impl AsRef<Path>,
+        mut config: EngineConfig,
+        selector: AsOfSelector,
+    ) -> Result<Self> {
+        config.follow_only = true;
+        let state_dir = state_dir.as_ref().to_path_buf();
+        fs::create_dir_all(&state_dir)
+            .map_err(|e| Error::new(Errno::EIO, format!("state_dir: {e}")))?;
+        let local_sidecar_dir = state_dir.join("local_sidecar");
+        fs::create_dir_all(&local_sidecar_dir)
+            .map_err(|e| Error::new(Errno::EIO, format!("local_sidecar: {e}")))?;
+
+        let commit_id = resolve_as_of(&transport, &config.branch, &selector).await?;
+        let (pages, policy) = Self::fetch_volume_from_remote(&transport, commit_id).await?;
+        let vol = Volume::mount(pages, false, config.mount_id)?;
+        let (journal, _) = LocalJournal::open(
+            state_dir.join("journal"),
+            config.master_key.as_ref(),
+            config.journal_capacity,
+            config.on_journal_full,
+        )?;
+        let mount_uuid = format!("mount-{:016x}", config.mount_id);
+        let lease_mgr = LeaseManager::new(&config.holder_name, mount_uuid, config.lease_policy);
+
+        Ok(WriteBackEngine {
+            transport,
+            config,
+            role: MountRole::Follower,
+            lease_mgr,
+            state_dir,
+            local_sidecar_dir,
+            state_file: LocalStateFile {
+                last_seen_head: Some(commit_id.to_hex()),
+                highest_epoch: vol.superblock().epoch,
+                pinned_signers: Vec::new(),
+            },
+            mount_state: MountState::Online,
+            vol,
+            policy,
+            journal,
+            atomic: AtomicRegion::default(),
+            volatile_files: BTreeMap::new(),
+            group_ops: Vec::new(),
+            dirty_bytes: 0,
+            head: commit_id,
+            pending_unknown_commit: None,
+            remote_commits: 0,
+            next_seq: 1,
+            conflicts: ConflictLog::default(),
+            consecutive_races: 0,
+            open_files: OpenFileTable::default(),
+            snapshot_cache: BTreeMap::new(),
+            next_snapshot_slot: 1,
+        })
+    }
+
+    pub async fn open_handle(&mut self, path: &str) -> Result<u64> {
+        let _ = self.resolve_ino(path)?;
+        let commit_id = self.head;
+        self.ensure_snapshot_cached(commit_id).await?;
+        Ok(self.open_files.open_handle(path.replace('\\', "/"), commit_id))
+    }
+
+    pub fn read_handle(&self, fh: u64, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let (path, pinned_commit) = self
+            .open_files
+            .get(fh)
+            .ok_or_else(|| Error::new(Errno::EINVAL, "invalid file handle"))?;
+        if *pinned_commit == self.head {
+            return self.read(path, offset, len);
+        }
+        let (_, snap_vol) = self
+            .snapshot_cache
+            .get(pinned_commit)
+            .ok_or_else(|| Error::new(Errno::EIO, "pinned snapshot missing from cache"))?;
+        let ino = Self::resolve_ino_in_vol(snap_vol, path)?;
+        snap_vol.read(ino, offset, len)
+    }
+
+    pub fn close_handle(&mut self, fh: u64) -> Result<()> {
+        self.open_files
+            .close_handle(fh)
+            .ok_or_else(|| Error::new(Errno::EINVAL, "invalid file handle"))?;
+        Ok(())
+    }
+
+    pub async fn poll_remote(&mut self) -> Result<bool> {
+        let refs = self
+            .transport
+            .list_refs(&[&self.config.branch])
+            .await
+            .map_err(|e| Error::new(Errno::EIO, format!("list_refs: {e}")))?;
+        let Some(remote_head) = refs
+            .into_iter()
+            .find(|r| r.name == self.config.branch)
+            .map(|r| r.id)
+        else {
+            return Ok(false);
+        };
+        if remote_head == self.head {
+            return Ok(false);
+        }
+        if !Self::is_descendant(&self.transport, remote_head, self.head).await? {
+            self.mount_state = MountState::Diverged;
+            self.role = MountRole::Follower;
+            return Err(Error::new(
+                Errno::EROFS,
+                "remote head diverged on poll (REQ-5)",
+            ));
+        }
+
+        let old_head = self.head;
+        if self.open_files.pinned_commits().contains(&old_head) {
+            self.ensure_snapshot_cached(old_head).await?;
+        }
+
+        let (pages, policy) = Self::fetch_volume_from_remote(&self.transport, remote_head).await?;
+        self.vol = Volume::mount(pages, true, self.config.mount_id)?;
+        self.policy = policy;
+        self.head = remote_head;
+        self.save_state_file()?;
+        Ok(true)
+    }
+
+    pub async fn create_branch(&self, name: &str) -> Result<RefInfo> {
+        create_branch(&self.transport, name, self.head).await
+    }
+
+    pub async fn list_branches(&self) -> Result<Vec<RefInfo>> {
+        list_branches(&self.transport).await
+    }
+
+    pub async fn switch_branch(&mut self, branch_name: &str) -> Result<()> {
+        if !self.group_ops.is_empty() || self.journal.depth_ops() > 0 {
+            self.sync_remote().await?;
+        }
+        let full_ref = if branch_name.starts_with("refs/heads/") {
+            branch_name.to_string()
+        } else {
+            format!("refs/heads/{branch_name}")
+        };
+        let refs = self
+            .transport
+            .list_refs(&[&full_ref])
+            .await
+            .map_err(|e| Error::new(Errno::EIO, format!("list_refs: {e}")))?;
+        let target_head = refs
+            .into_iter()
+            .find(|r| r.name == full_ref)
+            .map(|r| r.id)
+            .ok_or_else(|| Error::new(Errno::ENOENT, format!("branch {full_ref} not found")))?;
+
+        let (pages, policy) = Self::fetch_volume_from_remote(&self.transport, target_head).await?;
+        self.vol = Volume::mount(pages, true, self.config.mount_id)?;
+        self.policy = policy;
+        self.config.branch = full_ref;
+        self.head = target_head;
+        self.state_file.highest_epoch = self.vol.superblock().epoch;
+        self.save_state_file()?;
+        Ok(())
+    }
+
+    pub async fn create_snapshot(&self, name: &str) -> Result<RefInfo> {
+        create_snapshot(&self.transport, name, self.head).await
+    }
+
+    pub async fn list_snapshots(&self) -> Result<Vec<RefInfo>> {
+        list_snapshots(&self.transport).await
+    }
+
+    pub async fn merge_branch(
+        &mut self,
+        source_branch: &str,
+        base_commit: ObjectId,
+    ) -> Result<usize> {
+        let full_ref = if source_branch.starts_with("refs/heads/") {
+            source_branch.to_string()
+        } else {
+            format!("refs/heads/{source_branch}")
+        };
+        let refs = self
+            .transport
+            .list_refs(&[&full_ref])
+            .await
+            .map_err(|e| Error::new(Errno::EIO, format!("list_refs: {e}")))?;
+        let source_tip = refs
+            .into_iter()
+            .find(|r| r.name == full_ref)
+            .map(|r| r.id)
+            .ok_or_else(|| Error::new(Errno::ENOENT, "source branch not found"))?;
+
+        let (src_pages, _) = Self::fetch_volume_from_remote(&self.transport, source_tip).await?;
+        let src_vol = Volume::mount(src_pages, false, self.config.mount_id)?;
+        let (base_pages, _) = Self::fetch_volume_from_remote(&self.transport, base_commit).await?;
+        let base_vol = Volume::mount(base_pages, false, self.config.mount_id)?;
+
+        let applied = self.merge_tree_recursive(&base_vol, &src_vol, ROOT_INO, ROOT_INO, "")?;
+        if applied > 0 {
+            self.sync_remote().await?;
+        }
+        Ok(applied)
+    }
+
+    fn merge_tree_recursive(
+        &mut self,
+        base_vol: &Volume,
+        src_vol: &Volume,
+        base_dir_ino: u64,
+        src_dir_ino: u64,
+        prefix: &str,
+    ) -> Result<usize> {
+        let mut applied = 0usize;
+        let entries = src_vol.readdir(src_dir_ino, 0)?;
+        for entry in entries {
+            let name_str = String::from_utf8_lossy(&entry.name);
+            if name_str == "." || name_str == ".." {
+                continue;
+            }
+            let full_path = format!("{prefix}/{name_str}");
+            let src_attr = src_vol.getattr(entry.ino)?;
+            let base_ino = if base_dir_ino != 0 {
+                base_vol.lookup(base_dir_ino, &entry.name).ok()
+            } else {
+                None
+            };
+
+            if (src_attr.mode & S_IFDIR) == S_IFDIR {
+                if self.resolve_ino(&full_path).is_err() {
+                    self.mkdir(&full_path, src_attr.mode & 0o7777, src_attr.uid, src_attr.gid)?;
+                    applied += 1;
+                }
+                applied += self.merge_tree_recursive(
+                    base_vol,
+                    src_vol,
+                    base_ino.unwrap_or(0),
+                    entry.ino,
+                    &full_path,
+                )?;
+            } else if (src_attr.mode & S_IFREG) == S_IFREG {
+                let src_bytes = src_vol.read(entry.ino, 0, src_attr.size as usize)?;
+                let base_bytes = base_ino.and_then(|b_ino| {
+                    let b_attr = base_vol.getattr(b_ino).ok()?;
+                    base_vol.read(b_ino, 0, b_attr.size as usize).ok()
+                });
+                if base_bytes.as_ref() != Some(&src_bytes) {
+                    let local_bytes = self.read(&full_path, 0, 1 << 20).ok();
+                    if let Some(ref cur_local) = local_bytes
+                        && base_bytes.as_ref() != Some(cur_local)
+                        && cur_local != &src_bytes
+                    {
+                        let conflict_path = format!("{full_path}.conflict-merge");
+                        if self.resolve_ino(&conflict_path).is_err() {
+                            self.create(&conflict_path, 0o644, src_attr.uid, src_attr.gid)?;
+                        }
+                        self.write(&conflict_path, 0, &src_bytes)?;
+                        self.conflicts.push(ConflictRecord {
+                            batch_id: format!("merge-{}", self.vol.superblock().epoch),
+                            seq: self.next_seq,
+                            base_commit: self.head.to_hex(),
+                            remote_commit: "branch-merge".into(),
+                            path: full_path,
+                            preserved_copy: Some(conflict_path),
+                            reason: ConflictReason::ConcurrentModify,
+                        });
+                        applied += 1;
+                    } else {
+                        if self.resolve_ino(&full_path).is_err() {
+                            self.create(
+                                &full_path,
+                                src_attr.mode & 0o7777,
+                                src_attr.uid,
+                                src_attr.gid,
+                            )?;
+                        } else {
+                            self.truncate(&full_path, 0)?;
+                        }
+                        self.write(&full_path, 0, &src_bytes)?;
+                        applied += 1;
+                    }
+                }
+            }
+        }
+        Ok(applied)
+    }
+
+    async fn ensure_snapshot_cached(&mut self, commit_id: ObjectId) -> Result<(u16, &Volume)> {
+        if !self.snapshot_cache.contains_key(&commit_id) {
+            let (pages, _) = Self::fetch_volume_from_remote(&self.transport, commit_id).await?;
+            let vol = Volume::mount(pages, false, self.config.mount_id)?;
+            let slot = self.next_snapshot_slot;
+            self.next_snapshot_slot = self.next_snapshot_slot.saturating_add(1).max(1);
+            self.snapshot_cache.insert(commit_id, (slot, vol));
+        }
+        let (slot, vol) = self.snapshot_cache.get(&commit_id).unwrap();
+        Ok((*slot, vol))
+    }
+
+    pub async fn read_snapshot_path(
+        &mut self,
+        snap_id_or_tag: &str,
+        inner_path: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<(u64, Vec<u8>)> {
+        let commit_id = if let Ok(oid) = ObjectId::from_hex(snap_id_or_tag) {
+            oid
+        } else {
+            resolve_as_of(
+                &self.transport,
+                &self.config.branch,
+                &AsOfSelector::SnapshotTag(snap_id_or_tag.to_string()),
+            )
+            .await?
+        };
+        let (slot, snap_vol) = self.ensure_snapshot_cached(commit_id).await?;
+        let local_ino = Self::resolve_ino_in_vol(snap_vol, inner_path)?;
+        let data = snap_vol.read(local_ino, offset, len)?;
+        Ok((encode_snapshot_ino(slot, local_ino), data))
+    }
+
+    fn resolve_ino_in_vol(vol: &Volume, path: &str) -> Result<u64> {
+        let norm = path.replace('\\', "/");
+        let parts: Vec<&str> = norm.split('/').filter(|p| !p.is_empty()).collect();
+        let mut curr = ROOT_INO;
+        for part in parts {
+            curr = vol.lookup(curr, part.as_bytes())?;
+        }
+        Ok(curr)
     }
     /// Force-break the writer lease on `refs/octopage/lease` (`octoblock lease break`, Section 7.2).
     ///
@@ -1048,6 +1576,12 @@ impl<T: Transport> WriteBackEngine<T> {
             let end = (off + len).min(text.len());
             return Ok(text[off..end].to_vec());
         }
+        if norm == "/.octoblock/conflicts" || norm == "/.octoblock/conflicts/index.json" {
+            let json = self.conflicts.to_json_bytes();
+            let off = (offset as usize).min(json.len());
+            let end = (off + len).min(json.len());
+            return Ok(json[off..end].to_vec());
+        }
 
         let (_, _, full) = self.resolve_parent_and_name(path)?;
         let ino = self.resolve_ino(path)?;
@@ -1261,33 +1795,49 @@ impl<T: Transport> WriteBackEngine<T> {
             return Err(Error::new(Errno::EROFS, "follower mount cannot push"));
         }
         if self.atomic.active {
-            // REQ-3: No commit group may be split inside an atomic region.
             return Ok(());
         }
-        // REQ-11: Empty groups MUST NOT be committed.
         if self.group_ops.is_empty() && self.journal.depth_ops() == 0 {
             return Ok(());
         }
 
-        // Section 7.2: Verify or reacquire the writer lease before pushing when `--lease required`.
         if self.config.lease_policy == LeasePolicy::Required {
             self.renew_lease().await?;
             if self.mount_state == MountState::Fenced {
-                // Fenced mounts MUST NOT push to the remote; ops stay safely in the local journal.
                 self.journal.barrier()?;
                 return Ok(());
             }
         }
 
-        let coalesced = coalesce_and_elide(&self.group_ops);
-        let changelog = encode_changelog(&coalesced);
-        let _ = self.vol.commit_group()?;
-        self.push_volume_state(&changelog, false).await?;
-        self.group_ops.clear();
-        self.dirty_bytes = 0;
-        self.journal.truncate_committed()?;
-        self.mount_state = MountState::Online;
-        self.save_state_file()?;
+        self.journal.barrier()?;
+        for _race in 0..=MAX_CONSECUTIVE_RACES {
+            let coalesced = coalesce_and_elide(&self.group_ops);
+            let changelog = encode_changelog(&coalesced);
+            let _ = self.vol.commit_group()?;
+            match self.push_volume_state(&changelog, false).await {
+                Ok(()) => {
+                    self.group_ops.clear();
+                    self.dirty_bytes = 0;
+                    self.journal.truncate_committed()?;
+                    self.consecutive_races = 0;
+                    self.mount_state = MountState::Online;
+                    self.save_state_file()?;
+                    return Ok(());
+                }
+                Err(e) if e.errno == Errno::EAGAIN => {
+                    self.consecutive_races += 1;
+                    if self.consecutive_races >= MAX_CONSECUTIVE_RACES {
+                        self.mount_state = MountState::Contended;
+                        return Err(Error::new(
+                            Errno::EAGAIN,
+                            "8 consecutive CAS races lost; mount is CONTENDED (Section 7.3)",
+                        ));
+                    }
+                    self.reconcile_after_fencing().await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
         Ok(())
     }
 
@@ -1416,6 +1966,9 @@ impl<T: Transport> WriteBackEngine<T> {
                     self.pending_unknown_commit = None;
                     self.remote_commits += 1;
                     return Ok(());
+                }
+                Err(octopage_git::Error::Conflict { .. }) => {
+                    return Err(Error::new(Errno::EAGAIN, "remote head CAS conflict"));
                 }
                 Err(octopage_git::Error::PushOutcomeUnknown(_)) => {
                     self.pending_unknown_commit = Some((commit_id, epoch));
@@ -1833,6 +2386,196 @@ mod tests {
         assert_eq!(
             m1.read("/from_m1_fenced.txt", 0, 64).unwrap(),
             b"journaled-while-fenced"
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_d_multi_writer_replay_and_conflict_records() {
+        let remote = Arc::new(InMemory::new());
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+
+        let cfg1 = EngineConfig {
+            mount_id: 10,
+            lease_policy: LeasePolicy::Advisory,
+            holder_name: "mw-1".into(),
+            ..EngineConfig::default()
+        };
+        let cfg2 = EngineConfig {
+            mount_id: 20,
+            lease_policy: LeasePolicy::Advisory,
+            holder_name: "mw-2".into(),
+            ..EngineConfig::default()
+        };
+
+        let mut mw1 = WriteBackEngine::mkfs(
+            remote.clone(),
+            dir1.path(),
+            cfg1,
+            4096,
+            CasePolicy::Sensitive,
+            PolicyEngine::tier0_default(),
+        )
+        .await
+        .unwrap();
+        let mut mw2 = WriteBackEngine::mount(remote.clone(), dir2.path(), cfg2)
+            .await
+            .unwrap();
+        assert_eq!(mw1.role(), MountRole::MultiWriter);
+        assert_eq!(mw2.role(), MountRole::MultiWriter);
+
+        mw1.create("/only_mw1.txt", 0o644, 1000, 1000).unwrap();
+        mw1.write("/only_mw1.txt", 0, b"mw1-clean").unwrap();
+        mw1.create("/shared.conf", 0o644, 1000, 1000).unwrap();
+        mw1.write("/shared.conf", 0, b"winner-version").unwrap();
+        mw1.sync_remote().await.unwrap();
+
+        mw2.create("/only_mw2.txt", 0o644, 1000, 1000).unwrap();
+        mw2.write("/only_mw2.txt", 0, b"mw2-clean").unwrap();
+        mw2.create("/shared.conf", 0o644, 1000, 1000).unwrap();
+        mw2.write("/shared.conf", 0, b"loser-preserved-version")
+            .unwrap();
+        mw2.sync_remote().await.unwrap();
+
+        assert_eq!(mw2.read("/only_mw1.txt", 0, 64).unwrap(), b"mw1-clean");
+        assert_eq!(mw2.read("/only_mw2.txt", 0, 64).unwrap(), b"mw2-clean");
+        assert_eq!(
+            mw2.read("/shared.conf", 0, 64).unwrap(),
+            b"winner-version"
+        );
+
+        assert_eq!(mw2.conflicts().len(), 1);
+        let rec = &mw2.conflicts().records[0];
+        assert_eq!(rec.path, "/shared.conf");
+        assert_eq!(rec.reason, ConflictReason::CreateCollision);
+        let preserved_path = rec.preserved_copy.as_ref().unwrap();
+        assert_eq!(
+            mw2.read(preserved_path, 0, 64).unwrap(),
+            b"loser-preserved-version"
+        );
+        let conflict_json = mw2.read("/.octoblock/conflicts/index.json", 0, 4096).unwrap();
+        assert!(String::from_utf8_lossy(&conflict_json).contains("create_collision"));
+    }
+
+    #[tokio::test]
+    async fn phase_d_follower_close_to_open_coherence() {
+        let remote = Arc::new(InMemory::new());
+        let dir_w = tempfile::tempdir().unwrap();
+        let dir_f = tempfile::tempdir().unwrap();
+
+        let mut writer = WriteBackEngine::mkfs(
+            remote.clone(),
+            dir_w.path(),
+            EngineConfig {
+                mount_id: 1,
+                ..EngineConfig::default()
+            },
+            4096,
+            CasePolicy::Sensitive,
+            PolicyEngine::tier0_default(),
+        )
+        .await
+        .unwrap();
+        writer.create("/data.log", 0o644, 1000, 1000).unwrap();
+        writer.write("/data.log", 0, b"version-1").unwrap();
+        writer.sync_remote().await.unwrap();
+
+        let mut follower = WriteBackEngine::mount(
+            remote.clone(),
+            dir_f.path(),
+            EngineConfig {
+                mount_id: 2,
+                follow_only: true,
+                ..EngineConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(follower.role(), MountRole::Follower);
+
+        let fh_v1 = follower.open_handle("/data.log").await.unwrap();
+        assert_eq!(follower.read_handle(fh_v1, 0, 64).unwrap(), b"version-1");
+
+        writer.truncate("/data.log", 0).unwrap();
+        writer.write("/data.log", 0, b"version-2").unwrap();
+        writer.sync_remote().await.unwrap();
+
+        assert!(follower.poll_remote().await.unwrap());
+        assert_eq!(follower.read_handle(fh_v1, 0, 64).unwrap(), b"version-1");
+        let fh_v2 = follower.open_handle("/data.log").await.unwrap();
+        assert_eq!(follower.read_handle(fh_v2, 0, 64).unwrap(), b"version-2");
+        follower.close_handle(fh_v1).unwrap();
+        follower.close_handle(fh_v2).unwrap();
+    }
+
+    #[tokio::test]
+    async fn phase_d_branches_snapshots_time_travel_and_merge() {
+        let remote = Arc::new(InMemory::new());
+        let dir = tempfile::tempdir().unwrap();
+        let dir_as_of = tempfile::tempdir().unwrap();
+
+        let mut engine = WriteBackEngine::mkfs(
+            remote.clone(),
+            dir.path(),
+            EngineConfig {
+                mount_id: 1,
+                lease_policy: LeasePolicy::Off,
+                ..EngineConfig::default()
+            },
+            4096,
+            CasePolicy::Sensitive,
+            PolicyEngine::tier0_default(),
+        )
+        .await
+        .unwrap();
+
+        engine.create("/readme.md", 0o644, 1000, 1000).unwrap();
+        engine.write("/readme.md", 0, b"v1-baseline").unwrap();
+        engine.sync_remote().await.unwrap();
+        let base_commit = engine.head_commit();
+
+        engine.create_snapshot("v1.0").await.unwrap();
+        assert_eq!(engine.list_snapshots().await.unwrap().len(), 1);
+
+        engine.create_branch("feature").await.unwrap();
+        assert_eq!(engine.list_branches().await.unwrap().len(), 2);
+        engine.switch_branch("feature").await.unwrap();
+        engine.create("/feature.txt", 0o644, 1000, 1000).unwrap();
+        engine.write("/feature.txt", 0, b"feature-work").unwrap();
+        engine.sync_remote().await.unwrap();
+
+        engine.switch_branch("main").await.unwrap();
+        assert!(engine.resolve_ino("/feature.txt").is_err());
+        engine.truncate("/readme.md", 0).unwrap();
+        engine.write("/readme.md", 0, b"v2-updated-on-main").unwrap();
+        engine.sync_remote().await.unwrap();
+
+        let (snap_ino, snap_bytes) = engine
+            .read_snapshot_path("v1.0", "/readme.md", 0, 64)
+            .await
+            .unwrap();
+        assert_eq!(snap_bytes, b"v1-baseline");
+        let (slot, _local_ino) = crate::branch::decode_snapshot_ino(snap_ino);
+        assert!(slot >= 1, "snapshot inode must have non-zero high 16-bit slot");
+
+        let time_travel = WriteBackEngine::mount_as_of(
+            remote.clone(),
+            dir_as_of.path(),
+            EngineConfig::default(),
+            AsOfSelector::Commit(base_commit),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            time_travel.read("/readme.md", 0, 64).unwrap(),
+            b"v1-baseline"
+        );
+
+        let merged_ops = engine.merge_branch("feature", base_commit).await.unwrap();
+        assert!(merged_ops > 0);
+        assert_eq!(
+            engine.read("/feature.txt", 0, 64).unwrap(),
+            b"feature-work"
         );
     }
 }
