@@ -1,16 +1,11 @@
-//! OctoBlock Layer 4 Write-Back Engine & User-Space Daemon Core (`octoblock-wb`).
-//!
-//! Connects `octoblock-fs::Volume` (`OBF1`) with the local encrypted write-ahead journal
-//! (`L1`), path-class routing (`persist`, `local`, `volatile`, `exclude`), op coalescing/elision,
-//! writer leases and fencing (`refs/octopage/lease`), `.octoblock/status` observability, and
-//! `octopage-git::Transport` remote group commits (`L2`).
-
 pub mod branch;
 pub mod coalesce;
+pub mod compact;
 pub mod conflict;
 pub mod journal;
 pub mod lease;
 pub mod policy;
+pub mod security;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -41,6 +36,11 @@ use crate::journal::{
 };
 use crate::lease::{LeaseManager, LeaseOutcome, LeasePolicy, LeaseRecord, MountRole};
 use crate::policy::PolicyEngine;
+use crate::compact::{CompactionReport, archive_generation_tag, is_compacted_continuation};
+use crate::security::{
+    decrypt_page_obex, encrypt_page_obex, format_signed_commit_message, signer_fingerprint,
+    verify_commit_signature,
+};
 
 /// Durability level reached by an operation (Section 1.5, Section 6.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -177,6 +177,14 @@ pub struct EngineConfig {
     pub master_key: Option<[u8; 32]>,
     /// Mount identifier for allocation group hashing and lease identity.
     pub mount_id: u64,
+    /// Soft live-bytes budget (`800 MB` default, Section 8.1).
+    pub budget_soft: u64,
+    /// Encrypt remote page blobs in `OBEX` envelopes using `master_key` (`Section 12.1`, `REQ-8`).
+    pub encrypt_remote_pages: bool,
+    /// Optional 32-byte commit-signing key (`Section 12.3`).
+    pub signer_key: Option<[u8; 32]>,
+    /// Required signer fingerprints (`Section 12.4`, `REQ-5`).
+    pub pinned_signers: Vec<String>,
 }
 
 impl Default for EngineConfig {
@@ -193,6 +201,10 @@ impl Default for EngineConfig {
             on_journal_full: OnJournalFull::Enospc,
             master_key: None,
             mount_id: 1,
+            budget_soft: octoblock_fs::DEFAULT_BUDGET_SOFT,
+            encrypt_remote_pages: false,
+            signer_key: None,
+            pinned_signers: Vec::new(),
         }
     }
 }
@@ -226,6 +238,13 @@ pub struct WriteBackEngine<T: Transport> {
     open_files: OpenFileTable,
     snapshot_cache: BTreeMap<ObjectId, (u16, Volume)>,
     next_snapshot_slot: u16,
+    generation: u64,
+}
+
+impl std::fmt::Debug for WriteBackEngine<std::sync::Arc<octopage_git::InMemory>> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteBackEngine").finish_non_exhaustive()
+    }
 }
 
 impl<T: Transport> WriteBackEngine<T> {
@@ -254,6 +273,7 @@ impl<T: Transport> WriteBackEngine<T> {
         let policy_blob = Object::blob(policy_toml.clone())
             .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
         vol.set_policy_sha(policy_blob.id().as_bytes().to_vec());
+        vol.set_budget_soft(config.budget_soft);
 
         let (journal, _) = LocalJournal::open(
             state_dir.join("journal"),
@@ -297,6 +317,7 @@ impl<T: Transport> WriteBackEngine<T> {
             open_files: OpenFileTable::default(),
             snapshot_cache: BTreeMap::new(),
             next_snapshot_slot: 1,
+            generation: 1,
         };
         engine
             .push_volume_state(
@@ -360,7 +381,33 @@ impl<T: Transport> WriteBackEngine<T> {
             }
         };
 
-        let (pages, policy) = Self::fetch_volume_from_remote(&transport, head).await?;
+        let page_key = config
+            .encrypt_remote_pages
+            .then_some(config.master_key.as_ref())
+            .flatten();
+        let effective_signers = if !config.pinned_signers.is_empty() {
+            &config.pinned_signers
+        } else {
+            &state_file.pinned_signers
+        };
+        let (pages, policy) = match Self::fetch_volume_from_remote_with_security(
+            &transport,
+            head,
+            page_key,
+            effective_signers,
+            config.signer_key.as_ref(),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(e) if e.errno == Errno::EPERM => {
+                return Err(Error::new(
+                    Errno::EROFS,
+                    format!("diverged / untrusted commit signer: {e}"),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
         let mut vol = Volume::mount(pages, true, config.mount_id)?;
 
         // Section 6.9 step 2 & Section 12.4 (REQ-5): Anti-rollback check.
@@ -425,6 +472,7 @@ impl<T: Transport> WriteBackEngine<T> {
             open_files: OpenFileTable::default(),
             snapshot_cache: BTreeMap::new(),
             next_snapshot_slot: 1,
+            generation: 1,
         };
         if engine.mount_state != MountState::Diverged {
             engine.save_state_file()?;
@@ -767,6 +815,7 @@ impl<T: Transport> WriteBackEngine<T> {
             open_files: OpenFileTable::default(),
             snapshot_cache: BTreeMap::new(),
             next_snapshot_slot: 1,
+            generation: 1,
         })
     }
 
@@ -1067,7 +1116,8 @@ impl<T: Transport> WriteBackEngine<T> {
         if self.role != MountRole::Follower && self.mount_state != MountState::Fenced {
             let _ = self.sync_remote().await;
         }
-        self.lease_mgr.release(&self.transport).await
+        self.lease_mgr.release(&self.transport).await?;
+        Ok(())
     }
 
     /// When a fenced mount reacquires the lease, check if the remote head moved while it was
@@ -1088,12 +1138,22 @@ impl<T: Transport> WriteBackEngine<T> {
                 return Ok(true);
             }
         }
-        Ok(false)
+        is_compacted_continuation(transport, tip, ancestor).await
     }
 
     async fn fetch_volume_from_remote(
         transport: &T,
         commit_id: ObjectId,
+    ) -> Result<(BTreeMap<PageId, Bytes>, PolicyEngine)> {
+        Self::fetch_volume_from_remote_with_security(transport, commit_id, None, &[], None).await
+    }
+
+    async fn fetch_volume_from_remote_with_security(
+        transport: &T,
+        commit_id: ObjectId,
+        master_key: Option<&[u8; 32]>,
+        pinned_signers: &[String],
+        signer_key: Option<&[u8; 32]>,
     ) -> Result<(BTreeMap<PageId, Bytes>, PolicyEngine)> {
         let commit_objs = transport
             .fetch(&[commit_id])
@@ -1101,6 +1161,13 @@ impl<T: Transport> WriteBackEngine<T> {
             .map_err(|e| Error::new(Errno::EIO, format!("fetch commit: {e}")))?;
         let commit = Commit::decode(commit_objs[0].data())
             .map_err(|e| Error::new(Errno::EIO, format!("decode commit: {e}")))?;
+        verify_commit_signature(
+            &commit.message,
+            commit.tree,
+            &commit.parents,
+            pinned_signers,
+            signer_key,
+        )?;
         let root_objs = transport
             .fetch(&[commit.tree])
             .await
@@ -1124,7 +1191,6 @@ impl<T: Transport> WriteBackEngine<T> {
             }
         }
 
-        // Walk the 3-level `pages/AA/BB/CC` fan-out tree and batch-fetch all page blobs.
         let mut blob_ids: Vec<(PageId, ObjectId)> = Vec::new();
         let top_objs = transport
             .fetch(&[pages_tree_id])
@@ -1177,11 +1243,11 @@ impl<T: Transport> WriteBackEngine<T> {
 
         let mut pages = BTreeMap::new();
         for (pid, oid) in blob_ids {
-            let data = by_oid
+            let raw = by_oid
                 .get(&oid)
-                .ok_or_else(|| Error::new(Errno::EIO, format!("missing blob {oid}")))?
-                .clone();
-            pages.insert(pid, data);
+                .ok_or_else(|| Error::new(Errno::EIO, format!("missing blob {oid}")))?;
+            let decrypted = decrypt_page_obex(master_key, pid, raw)?;
+            pages.insert(pid, decrypted);
         }
         Ok((pages, policy))
     }
@@ -1516,6 +1582,19 @@ impl<T: Transport> WriteBackEngine<T> {
         let rec = self.vol.getattr(ino)?;
         match rec.path_class() {
             PathClass::Persist => {
+                if self
+                    .vol
+                    .superblock()
+                    .live_bytes
+                    .saturating_add(data.len() as u64)
+                    > self.config.budget_soft
+                {
+                    self.mount_state = MountState::DegradedQuota;
+                    return Err(Error::new(
+                        Errno::ENOSPC,
+                        "live bytes would exceed volume soft budget (Section 8.1)",
+                    ));
+                }
                 let n = self.vol.write(ino, offset, data)?;
                 let updated = self.vol.getattr(ino)?;
                 let psize = u64::from(self.vol.superblock().page_size);
@@ -1841,31 +1920,44 @@ impl<T: Transport> WriteBackEngine<T> {
         Ok(())
     }
 
-    async fn push_volume_state(&mut self, changelog_bytes: &[u8], initial: bool) -> Result<()> {
-        if let Some((unknown_commit, _)) = self.pending_unknown_commit {
-            let refs = self
-                .transport
-                .list_refs(&[&self.config.branch])
-                .await
-                .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
-            if refs
-                .iter()
-                .any(|r| r.name == self.config.branch && r.id == unknown_commit)
-            {
-                self.head = unknown_commit;
-                self.pending_unknown_commit = None;
-                self.remote_commits += 1;
-                return Ok(());
-            }
+    /// Squash the remote commit history into a single root commit containing only the live `OBF1`
+    /// pages of the volume, optionally archiving the previous chain under `refs/tags/octoblock/gen-<N>`
+    /// (`octoblock compact`, Section 8.2, `REQ-6`).
+    pub async fn compact_history(&mut self, archive_generation: bool) -> Result<CompactionReport> {
+        if self.role == MountRole::Follower {
+            return Err(Error::new(Errno::EROFS, "follower mount cannot compact"));
+        }
+        if !self.group_ops.is_empty() || self.journal.depth_ops() > 0 {
+            self.sync_remote().await?;
         }
 
+        let old_head = self.head;
+        let generation = self.generation;
+        let archived_ref = if archive_generation && !old_head.is_zero() {
+            Some(archive_generation_tag(&self.transport, generation, old_head).await?)
+        } else {
+            None
+        };
+
+        // Advance volume epoch so the compacted root commit has strictly higher epoch (REQ-5).
+        let _ = self.vol.commit_group()?;
+        let epoch = self.vol.superblock().epoch;
+
+        // Build squashed root commit (`parents: Vec::new()`) with `Compacted-From: <old_head>` trailer.
         let pages = self.vol.clone_storage();
         let mut new_objects: Vec<NewObject> = Vec::new();
         let mut by_a: BTreeMap<u8, BTreeMap<u8, Vec<(u8, ObjectId)>>> = BTreeMap::new();
-
         for (pid, raw_bytes) in pages {
+            let payload = if self.config.encrypt_remote_pages {
+                let key = self.config.master_key.as_ref().ok_or_else(|| {
+                    Error::new(Errno::EINVAL, "encrypt_remote_pages requires master_key")
+                })?;
+                encrypt_page_obex(key, pid, epoch, &raw_bytes)
+            } else {
+                raw_bytes
+            };
             let blob =
-                Object::blob(raw_bytes).map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+                Object::blob(payload).map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
             let [a, b, c] = pid.bytes();
             by_a.entry(a)
                 .or_default()
@@ -1906,6 +1998,162 @@ impl<T: Transport> WriteBackEngine<T> {
             .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
         new_objects.push(pages_tree_obj.clone().into());
 
+        let changelog_obj = Object::blob(Bytes::from_static(
+            b"{\"seq\":0,\"t\":0.0,\"op\":\"barrier\",\"kind\":\"compact_root\"}\n",
+        ))
+        .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+        new_objects.push(changelog_obj.clone().into());
+
+        let policy_obj = Object::blob(Bytes::from(self.policy.to_toml()))
+            .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+        new_objects.push(policy_obj.clone().into());
+
+        let mut root_tree = Tree::new();
+        root_tree
+            .insert(TreeEntry::tree("pages", pages_tree_obj.id()))
+            .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+        root_tree
+            .insert(TreeEntry::blob("changelog", changelog_obj.id()))
+            .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+        root_tree
+            .insert(TreeEntry::blob("policy.toml", policy_obj.id()))
+            .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+        let root_tree_obj = root_tree
+            .to_object()
+            .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+        new_objects.push(root_tree_obj.clone().into());
+
+        let commit_time = 1_791_371_000 + (epoch as i64);
+        let sig = Signature::new("octoblock", "octoblock@example.invalid", commit_time);
+        let base_msg = format!(
+            "octoblock group epoch {epoch}\nCompacted-From: {}\nGeneration: {generation}",
+            old_head.to_hex()
+        );
+        let message = if let Some(ref sk) = self.config.signer_key {
+            format_signed_commit_message(&base_msg, sk, root_tree_obj.id(), &[], epoch)
+        } else {
+            format!("{base_msg}\n").into_bytes()
+        };
+        let commit_obj = Commit {
+            tree: root_tree_obj.id(),
+            parents: Vec::new(),
+            author: sig.clone(),
+            committer: sig,
+            message,
+        }
+        .to_object()
+        .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+        let new_head = commit_obj.id();
+        new_objects.push(commit_obj.into());
+
+        let update = RefUpdate::update(&self.config.branch, old_head, new_head);
+        self.transport
+            .push(&[update], &new_objects)
+            .await
+            .map_err(|e| Error::new(Errno::EIO, format!("compact push failed: {e}")))?;
+
+        self.head = new_head;
+        self.generation += 1;
+        self.remote_commits += 1;
+        self.save_state_file()?;
+
+        Ok(CompactionReport {
+            generation,
+            archived_ref,
+            old_head: old_head.to_hex(),
+            new_head: new_head.to_hex(),
+            epoch,
+            live_bytes: self.vol.superblock().live_bytes,
+        })
+    }
+
+    async fn push_volume_state(&mut self, changelog_bytes: &[u8], initial: bool) -> Result<()> {
+        if let Some((unknown_commit, _)) = self.pending_unknown_commit {
+            let refs = self
+                .transport
+                .list_refs(&[&self.config.branch])
+                .await
+                .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+            if refs
+                .iter()
+                .any(|r| r.name == self.config.branch && r.id == unknown_commit)
+            {
+                self.head = unknown_commit;
+                self.pending_unknown_commit = None;
+                self.remote_commits += 1;
+                return Ok(());
+            }
+        }
+
+        let pages = self.vol.clone_storage();
+        let mut new_objects: Vec<NewObject> = Vec::new();
+        let mut by_a: BTreeMap<u8, BTreeMap<u8, Vec<(u8, ObjectId)>>> = BTreeMap::new();
+
+        let epoch = self.vol.superblock().epoch;
+    for (pid, raw_bytes) in pages {
+        let payload = if self.config.encrypt_remote_pages {
+            let key = self.config.master_key.as_ref().ok_or_else(|| {
+                Error::new(Errno::EINVAL, "encrypt_remote_pages requires master_key")
+        })?;
+        encrypt_page_obex(key, pid, epoch, &raw_bytes)
+    } else {
+        raw_bytes
+    };
+
+    let blob =
+        Object::blob(payload).map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+
+    let [a, b, c] = pid.bytes();
+    by_a.entry(a)
+        .or_default()
+        .entry(b)
+        .or_default()
+        .push((c, blob.id()));
+
+    new_objects.push(blob.into());
+}
+
+let mut top_tree = Tree::new();
+for (a, by_b) in by_a {
+    let mut mid_tree = Tree::new();
+
+    for (b, leaves) in by_b {
+        let mut leaf_tree = Tree::new();
+
+        for (c, blob_id) in leaves {
+            leaf_tree
+                .insert(TreeEntry::blob(format!("{c:02x}"), blob_id))
+                .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+        }
+
+        let leaf_obj = leaf_tree
+            .to_object()
+            .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+
+        mid_tree
+            .insert(TreeEntry::tree(format!("{b:02x}"), leaf_obj.id()))
+            .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+
+        new_objects.push(leaf_obj.into());
+    }
+
+    let mid_obj = mid_tree
+        .to_object()
+        .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+
+    top_tree
+        .insert(TreeEntry::tree(format!("{a:02x}"), mid_obj.id()))
+        .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+
+    new_objects.push(mid_obj.into());
+}
+
+let pages_tree_obj = top_tree
+    .to_object()
+    .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
+
+new_objects.push(pages_tree_obj.clone().into());
+
         let changelog_obj = Object::blob(Bytes::copy_from_slice(changelog_bytes))
             .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
         new_objects.push(changelog_obj.clone().into());
@@ -1929,21 +2177,30 @@ impl<T: Transport> WriteBackEngine<T> {
             .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
         new_objects.push(root_tree_obj.clone().into());
 
-        let epoch = self.vol.superblock().epoch;
         let commit_time = 1_791_371_000 + (epoch as i64);
-        let sig = Signature::new("octoblock", "octoblock@example.invalid", commit_time);
-        let parents = if initial || self.head.is_zero() {
-            Vec::new()
-        } else {
-            vec![self.head]
-        };
-        let commit_obj = Commit {
-            tree: root_tree_obj.id(),
-            parents,
-            author: sig.clone(),
-            committer: sig,
-            message: format!("octoblock group epoch {epoch}\n").into_bytes(),
+    let sig = Signature::new("octoblock", "octoblock@example.invalid", commit_time);
+    let parents = if initial || self.head.is_zero() {
+        Vec::new()
+    } else {
+        vec![self.head]
+    };
+    let base_msg = format!("octoblock group epoch {epoch}");
+    let message = if let Some(ref sk) = self.config.signer_key {
+        let fp = signer_fingerprint(sk);
+        if !self.state_file.pinned_signers.contains(&fp) {
+           self.state_file.pinned_signers.push(fp);
         }
+        format_signed_commit_message(&base_msg, sk, root_tree_obj.id(), &parents, epoch)
+    } else {
+        format!("{base_msg}\n").into_bytes()
+    };
+    let commit_obj = Commit {
+       tree: root_tree_obj.id(),
+       parents,
+       author: sig.clone(),
+       committer: sig,
+       message,
+    }
         .to_object()
         .map_err(|e| Error::new(Errno::EIO, e.to_string()))?;
         let commit_id = commit_obj.id();
@@ -2018,6 +2275,10 @@ impl<T: Transport> WriteBackEngine<T> {
     }
 
     fn update_journal_health(&mut self) {
+        if self.vol.superblock().live_bytes >= self.config.budget_soft {
+            self.mount_state = MountState::DegradedQuota;
+            return;
+        }
         if self.mount_state == MountState::Fenced {
             return;
         }
@@ -2576,6 +2837,170 @@ mod tests {
         assert_eq!(
             engine.read("/feature.txt", 0, 64).unwrap(),
             b"feature-work"
+        );
+    }
+    #[tokio::test]
+    async fn phase_e_remote_page_encryption_and_tamper_detection() {
+        let remote = Arc::new(InMemory::new());
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let key = [0xA5; 32];
+
+        let cfg = EngineConfig {
+            master_key: Some(key),
+            encrypt_remote_pages: true,
+            lease_policy: LeasePolicy::Off,
+            ..EngineConfig::default()
+        };
+
+        let mut m1 = WriteBackEngine::mkfs(
+            remote.clone(),
+            dir1.path(),
+            cfg.clone(),
+            4096,
+            CasePolicy::Sensitive,
+            PolicyEngine::tier0_default(),
+        )
+        .await
+        .unwrap();
+        m1.create("/secret.txt", 0o644, 1000, 1000).unwrap();
+        m1.write("/secret.txt", 0, b"confidential-obex-payload")
+            .unwrap();
+        m1.sync_remote().await.unwrap();
+
+        // Mounting without master_key or with wrong key MUST fail (REQ-8).
+        let bad_cfg = EngineConfig {
+            master_key: Some([0xFF; 32]),
+            encrypt_remote_pages: true,
+            lease_policy: LeasePolicy::Off,
+            ..EngineConfig::default()
+        };
+        assert!(WriteBackEngine::mount(remote.clone(), dir2.path(), bad_cfg)
+            .await
+            .is_err());
+
+        // Mounting with the correct key decrypts all OBEX pages cleanly.
+        let m2 = WriteBackEngine::mount(remote, dir2.path(), cfg)
+            .await
+            .unwrap();
+        assert_eq!(
+            m2.read("/secret.txt", 0, 64).unwrap(),
+            b"confidential-obex-payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_e_commit_signing_pinned_signers_and_anti_rollback() {
+        let remote = Arc::new(InMemory::new());
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let good_key = [0x11; 32];
+        let attacker_key = [0x99; 32];
+        let good_fp = crate::security::signer_fingerprint(&good_key);
+
+        let cfg1 = EngineConfig {
+            signer_key: Some(good_key),
+            pinned_signers: vec![good_fp.clone()],
+            lease_policy: LeasePolicy::Off,
+            ..EngineConfig::default()
+        };
+
+        let mut m1 = WriteBackEngine::mkfs(
+            remote.clone(),
+            dir1.path(),
+            cfg1.clone(),
+            4096,
+            CasePolicy::Sensitive,
+            PolicyEngine::tier0_default(),
+        )
+        .await
+        .unwrap();
+        let early_commit = m1.head_commit();
+
+        m1.create("/signed.txt", 0o644, 1000, 1000).unwrap();
+        m1.write("/signed.txt", 0, b"epoch-advance").unwrap();
+        m1.sync_remote().await.unwrap();
+        let latest_commit = m1.head_commit();
+
+        // 1. Pinned signer check: mounting with a different pinned signer rejects the commit (REQ-5).
+        let wrong_pin_cfg = EngineConfig {
+            pinned_signers: vec![crate::security::signer_fingerprint(&attacker_key)],
+            lease_policy: LeasePolicy::Off,
+            ..EngineConfig::default()
+        };
+        assert_eq!(
+            WriteBackEngine::mount(remote.clone(), dir2.path(), wrong_pin_cfg)
+                .await
+                .unwrap_err()
+                .errno,
+            Errno::EROFS
+        );
+
+        // 2. Anti-rollback check (REQ-5): force-resetting the remote branch back to `early_commit`
+        // causes `m1`'s next mount with its `state.json` to detect epoch regression and enter DIVERGED!
+        remote
+            .push(
+                &[RefUpdate::update("refs/heads/main", latest_commit, early_commit)],
+                &[],
+            )
+            .await
+            .unwrap();
+        let remounted = WriteBackEngine::mount(remote, dir1.path(), cfg1)
+            .await
+            .unwrap();
+        assert_eq!(remounted.status().state, MountState::Diverged);
+        assert_eq!(remounted.role(), MountRole::Follower);
+    }
+
+    #[tokio::test]
+    async fn phase_e_quota_budget_and_history_compaction() {
+        let remote = Arc::new(InMemory::new());
+        let dir = tempfile::tempdir().unwrap();
+
+        // Configure a tight 64 KiB soft budget to test quota enforcement and compaction recovery.
+        let cfg = EngineConfig {
+            budget_soft: 64 * 1024,
+            lease_policy: LeasePolicy::Off,
+            ..EngineConfig::default()
+        };
+        let mut engine = WriteBackEngine::mkfs(
+            remote.clone(),
+            dir.path(),
+            cfg.clone(),
+            4096,
+            CasePolicy::Sensitive,
+            PolicyEngine::tier0_default(),
+        )
+        .await
+        .unwrap();
+
+        engine.create("/big.bin", 0o644, 1000, 1000).unwrap();
+        // Write a payload larger than the 64 KiB budget (e.g. 128 KiB) to trigger ENOSPC directly
+        let res = engine.write("/big.bin", 0, &vec![0xAB; 128 * 1024]);
+        assert_eq!(res.unwrap_err().errno, Errno::ENOSPC);
+
+        // Create a smaller file that fits within the budget
+        engine.create("/kept.txt", 0o644, 1000, 1000).unwrap();
+        engine.write("/kept.txt", 0, b"survives-compaction").unwrap();
+        engine.sync_remote().await.unwrap();
+
+        // Compact history with generation archive tag (`refs/tags/octoblock/gen-1`, Section 8.2).
+        let report = engine.compact_history(true).await.unwrap();
+        assert_eq!(report.generation, 1);
+        assert_eq!(
+            report.archived_ref.as_deref(),
+            Some("refs/tags/octoblock/gen-1")
+        );
+
+        // Remount after compaction: anti-rollback recognizes `Compacted-From` and reads `/kept.txt`.
+        drop(engine);
+        let remounted = WriteBackEngine::mount(remote, dir.path(), cfg)
+            .await
+            .unwrap();
+        assert_eq!(remounted.status().state, MountState::Online);
+        assert_eq!(
+            remounted.read("/kept.txt", 0, 64).unwrap(),
+            b"survives-compaction"
         );
     }
 }
