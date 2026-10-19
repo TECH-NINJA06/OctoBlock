@@ -1,4 +1,5 @@
 pub mod branch;
+pub mod cli;
 pub mod coalesce;
 pub mod compact;
 pub mod conflict;
@@ -6,6 +7,7 @@ pub mod journal;
 pub mod lease;
 pub mod policy;
 pub mod security;
+pub mod vfs;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -3002,5 +3004,77 @@ mod tests {
             remounted.read("/kept.txt", 0, 64).unwrap(),
             b"survives-compaction"
         );
+    }
+    #[tokio::test]
+    async fn phase_f_vfs_virtual_namespace_ioctls_and_cli_commands() {
+        use crate::cli::{CliCommand, execute_cli};
+        use crate::vfs::{
+            OBX_IOC_ATOMIC_BEGIN, OBX_IOC_ATOMIC_END, VINO_OCTOBLOCK_DIR, VfsSession,
+        };
+
+        let remote = Arc::new(InMemory::new());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = EngineConfig {
+            lease_policy: LeasePolicy::Off,
+            ..EngineConfig::default()
+        };
+        let engine = WriteBackEngine::mkfs(
+            remote,
+            dir.path(),
+            cfg,
+            4096,
+            CasePolicy::Sensitive,
+            PolicyEngine::tier0_default(),
+        )
+        .await
+        .unwrap();
+
+        let mut vfs = VfsSession::new(engine);
+
+        // 1. VFS lookup reference counting & virtual /.octoblock directory
+        let vino = vfs.lookup("/.octoblock").await.unwrap();
+        assert_eq!(vino, VINO_OCTOBLOCK_DIR);
+        assert_eq!(vfs.lookup_count(vino), 1);
+        vfs.forget(vino, 1);
+        assert_eq!(vfs.lookup_count(vino), 0);
+
+        let entries = vfs.readdir("/.octoblock", 0).await.unwrap();
+        assert_eq!(entries.len(), 4);
+
+        // 2. Virtual /.octoblock namespace is strictly read-only (EROFS)
+        assert_eq!(
+            vfs.create("/.octoblock/hack", 0o644, 0, 0)
+                .unwrap_err()
+                .errno,
+            Errno::EROFS
+        );
+
+        // 3. Atomic transaction via VFS ioctl (OBX_IOC_ATOMIC_BEGIN / OBX_IOC_ATOMIC_END)
+        vfs.ioctl(OBX_IOC_ATOMIC_BEGIN).await.unwrap();
+        vfs.create("/app.toml", 0o644, 1000, 1000).unwrap();
+        vfs.write("/app.toml", 0, b"version = 1\n").unwrap();
+        vfs.ioctl(OBX_IOC_ATOMIC_END).await.unwrap();
+
+        // 4. Control-plane CLI execution (`snapshot create`, `status --json`, `fsck`)
+        let snap_out = execute_cli(
+            vfs.engine_mut(),
+            CliCommand::parse_args(&["snapshot", "create", "rel-1"]).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(snap_out.contains("refs/tags/octoblock/rel-1"));
+
+        // Overwrite live `/app.toml` and read historical version through VFS `/.octoblock/snapshots/rel-1/app.toml`
+        vfs.write("/app.toml", 0, b"version = 2\n").unwrap();
+        let snap_bytes = vfs
+            .read("/.octoblock/snapshots/rel-1/app.toml", 0, 64)
+            .await
+            .unwrap();
+        assert_eq!(snap_bytes, b"version = 1\n");
+
+        let fsck_out = execute_cli(vfs.engine_mut(), CliCommand::parse_args(&["fsck"]).unwrap())
+            .await
+            .unwrap();
+        assert!(fsck_out.contains("fsck clean=true"));
     }
 }
