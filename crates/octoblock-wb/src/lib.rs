@@ -3,6 +3,7 @@ pub mod cli;
 pub mod coalesce;
 pub mod compact;
 pub mod conflict;
+pub mod daemon;
 pub mod journal;
 pub mod lease;
 pub mod policy;
@@ -3076,5 +3077,89 @@ mod tests {
             .await
             .unwrap();
         assert!(fsck_out.contains("fsck clean=true"));
+    }
+    #[tokio::test]
+    async fn phase_g_fuse_inode_dispatcher_and_daemon_background_ticks() {
+        use crate::daemon::FuseDispatcher;
+        use crate::vfs::OBX_IOC_SYNC_L2;
+
+        let remote = Arc::new(InMemory::new());
+        let dir_w = tempfile::tempdir().unwrap();
+        let dir_f = tempfile::tempdir().unwrap();
+
+        // Writer daemon configured with a 1 KiB auto-flush threshold
+        let writer_engine = WriteBackEngine::mkfs(
+            remote.clone(),
+            dir_w.path(),
+            EngineConfig {
+                mount_id: 1,
+                flush_bytes: 1024,
+                ..EngineConfig::default()
+            },
+            4096,
+            CasePolicy::Sensitive,
+            PolicyEngine::tier0_default(),
+        )
+        .await
+        .unwrap();
+        let mut writer_daemon = FuseDispatcher::new(writer_engine, 1024);
+
+        //Follower daemon mounted on the same remote
+        let follower_engine = WriteBackEngine::mount(
+            remote.clone(),
+            dir_f.path(),
+            EngineConfig {
+                mount_id: 2,
+                follow_only: true,
+                ..EngineConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut follower_daemon = FuseDispatcher::new(follower_engine, 1024);
+
+        // 1. FUSE mkdir, create, write, and lookup by (parent_ino, name)
+        let docs_ino = writer_daemon
+            .fuse_mkdir(ROOT_INO, "docs", 0o755, 1000, 1000)
+            .await
+            .unwrap();
+        let (file_ino, fh) = writer_daemon
+            .fuse_create(docs_ino, "spec.md", 0o644, 1000, 1000)
+            .await
+            .unwrap();
+        let payload = vec![b'X'; 2048];
+        writer_daemon.fuse_write(file_ino, 0, &payload).unwrap();
+        writer_daemon.fuse_release(fh).unwrap();
+
+        // 2. Writer background_tick detects dirty_group_bytes >= 1024 and auto-flushes to L2!
+        let w_tick = writer_daemon.background_tick(false).await.unwrap();
+        assert!(w_tick.flushed_l2);
+        assert_eq!(writer_daemon.engine().status().journal_depth_ops, 0);
+
+        // 3. Follower background_tick polls the remote and pulls the new commit
+        let f_tick = follower_daemon.background_tick(false).await.unwrap();
+        assert!(f_tick.pulled_remote);
+
+        let (f_docs_ino, _) = follower_daemon.fuse_lookup(ROOT_INO, "docs").await.unwrap();
+        let (f_file_ino, attr) = follower_daemon
+            .fuse_lookup(f_docs_ino, "spec.md")
+            .await
+            .unwrap();
+        assert_eq!(attr.size, 2048);
+
+        let f_fh = follower_daemon.fuse_open(f_file_ino).await.unwrap();
+        let read_back = follower_daemon
+            .fuse_read(f_file_ino, Some(f_fh), 0, 2048)
+            .await
+            .unwrap();
+        assert_eq!(read_back, payload);
+        follower_daemon.fuse_release(f_fh).unwrap();
+
+        // 4. Rename & ioctl sync via FuseDispatcher, then clean daemon shutdown
+        writer_daemon
+            .fuse_rename(docs_ino, "spec.md", docs_ino, "final.md", 0)
+            .unwrap();
+        writer_daemon.fuse_ioctl(OBX_IOC_SYNC_L2).await.unwrap();
+        writer_daemon.shutdown().await.unwrap();
     }
 }
