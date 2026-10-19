@@ -59,12 +59,25 @@ pub async fn is_compacted_continuation<T: Transport>(
     let commit = Commit::decode(obj.data())
         .map_err(|e| Error::new(Errno::EIO, format!("decode commit: {e}")))?;
     let text = String::from_utf8_lossy(&commit.message);
-    let target_hex = ancestor.to_hex();
     for line in text.lines() {
         if let Some(prev) = line.trim().strip_prefix("Compacted-From:")
-            && prev.trim() == target_hex
+            && let Ok(prev_id) = ObjectId::from_hex(prev.trim())
         {
-            return Ok(true);
+            if prev_id == ancestor {
+                return Ok(true);
+            }
+            let hist = transport
+                .history(prev_id, Some(ancestor), false)
+                .await
+                .map_err(|e| Error::new(Errno::EIO, format!("history: {e}")))?;
+            for h_obj in hist {
+                if h_obj.kind() == ObjectKind::Commit
+                    && let Ok(c) = Commit::decode(h_obj.data())
+                    && c.parents.contains(&ancestor)
+                {
+                    return Ok(true);
+                }
+            }
         }
     }
     Ok(false)

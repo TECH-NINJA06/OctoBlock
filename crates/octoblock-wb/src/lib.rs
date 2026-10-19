@@ -3162,4 +3162,142 @@ mod tests {
         writer_daemon.fuse_ioctl(OBX_IOC_SYNC_L2).await.unwrap();
         writer_daemon.shutdown().await.unwrap();
     }
+    #[tokio::test]
+    async fn phase_h_multi_node_chaos_stress_and_end_to_end_verification() {
+        let remote = Arc::new(InMemory::new());
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let dir_f = tempfile::tempdir().unwrap();
+
+        let shared_key = [0x5A; 32];
+        let signer = [0x3C; 32];
+        let pin = crate::security::signer_fingerprint(&signer);
+
+        let cfg_a = EngineConfig {
+            mount_id: 100,
+            lease_policy: LeasePolicy::Advisory,
+            holder_name: "chaos-mw-a".into(),
+            master_key: Some(shared_key),
+            signer_key: Some(signer),
+            pinned_signers: vec![pin.clone()],
+            ..EngineConfig::default()
+        };
+        let cfg_b = EngineConfig {
+            mount_id: 200,
+            lease_policy: LeasePolicy::Advisory,
+            holder_name: "chaos-mw-b".into(),
+            master_key: Some(shared_key),
+            signer_key: Some(signer),
+            pinned_signers: vec![pin.clone()],
+            ..EngineConfig::default()
+        };
+        let cfg_f = EngineConfig {
+            mount_id: 300,
+            follow_only: true,
+            holder_name: "chaos-follower".into(),
+            master_key: Some(shared_key),
+            signer_key: Some(signer),
+            pinned_signers: vec![pin],
+            ..EngineConfig::default()
+        };
+
+        let mut node_a = WriteBackEngine::mkfs(
+            remote.clone(),
+            dir_a.path(),
+            cfg_a,
+            4096,
+            CasePolicy::Sensitive,
+            PolicyEngine::tier0_default(),
+        )
+        .await
+        .unwrap();
+        node_a.create("/anchor.txt", 0o644, 1000, 1000).unwrap();
+        node_a.write("/anchor.txt", 0, b"gen-0-anchor").unwrap();
+        node_a.sync_remote().await.unwrap();
+
+        let mut node_b = WriteBackEngine::mount(remote.clone(), dir_b.path(), cfg_b)
+            .await
+            .unwrap();
+        let mut follower = WriteBackEngine::mount(remote.clone(), dir_f.path(), cfg_f.clone())
+            .await
+            .unwrap();
+
+        // Pin an open file handle on the follower before the chaos rounds begin
+        let pinned_fh = follower.open_handle("/anchor.txt").await.unwrap();
+
+        for round in 0..40usize {
+            let path_a = format!("/node_a_{round}.dat");
+            let path_b = format!("/node_b_{round}.dat");
+            let payload_a = format!("a-round-{round}").into_bytes();
+            let payload_b = format!("b-round-{round}").into_bytes();
+
+            node_a.create(&path_a, 0o644, 1000, 1000).unwrap();
+            node_a.write(&path_a, 0, &payload_a).unwrap();
+
+            node_b.create(&path_b, 0o644, 1000, 1000).unwrap();
+            node_b.write(&path_b, 0, &payload_b).unwrap();
+
+            // Every 10th round, both nodes contend on the same new path to trigger conflict preservation
+            if round % 10 == 0 {
+                let contested = format!("/contested_{round}.conf");
+                node_a.create(&contested, 0o644, 1000, 1000).unwrap();
+                node_a.write(&contested, 0, b"winner-a").unwrap();
+
+                node_b.create(&contested, 0o644, 1000, 1000).unwrap();
+                node_b.write(&contested, 0, b"preserved-b").unwrap();
+            }
+
+            // Inject transport faults during remote sync
+            if round % 5 == 1 {
+                remote.inject(Fault::DropBeforeApply);
+            } else if round % 5 == 3 {
+                remote.inject(Fault::DropAfterApply);
+            }
+            node_a.sync_remote().await.unwrap();
+
+            if round % 7 == 2 {
+                remote.inject(Fault::DropAfterApply);
+            }
+            node_b.sync_remote().await.unwrap();
+
+            if round % 8 == 0 {
+                let _ = follower.poll_remote().await.unwrap();
+                // Pinned handle still reads the original snapshot content
+                assert_eq!(
+                    follower.read_handle(pinned_fh, 0, 64).unwrap(),
+                    b"gen-0-anchor"
+                );
+            }
+        }
+
+        // Sync Node A with Node B's latest commits and compact history into Generation 1
+        node_a.create("/final_a.txt", 0o644, 1000, 1000).unwrap();
+        node_a.write("/final_a.txt", 0, b"done").unwrap();
+        node_a.sync_remote().await.unwrap();
+
+        let report = node_a.compact_history(true).await.unwrap();
+        assert_eq!(report.generation, 1);
+        assert_eq!(
+            report.archived_ref.as_deref(),
+            Some("refs/tags/octoblock/gen-1")
+        );
+
+        // Follower polls across the compacted root commit and verifies all 80 per-node files + conflicts
+        follower.close_handle(pinned_fh).unwrap();
+        assert!(follower.poll_remote().await.unwrap());
+        assert_eq!(node_b.conflicts().len(), 4);
+
+        for round in 0..40usize {
+            let path_a = format!("/node_a_{round}.dat");
+            let path_b = format!("/node_b_{round}.dat");
+            assert_eq!(
+                follower.read(&path_a, 0, 64).unwrap(),
+                format!("a-round-{round}").as_bytes()
+            );
+            assert_eq!(
+                follower.read(&path_b, 0, 64).unwrap(),
+                format!("b-round-{round}").as_bytes()
+            );
+        }
+    }
 }
