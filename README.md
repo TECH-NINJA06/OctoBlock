@@ -22,7 +22,7 @@ volumes with a Git-compatible remote.
 +------------------------------------+  +-------------------------------------+
 |             OctoPage               |  |       OctoBlock VFS & Daemon        |
 |  - SQLite VFS & Catalog            |  |  - FuseDispatcher & VfsSession      |
-|  - Serializable Rebase & Replay    |  |  - Virtual /.octoblock/ Namespace  |
+|  - Serializable Rebase & Replay    |  |  - Virtual /.octoblock/ Namespace   |
 |  - AS OF Time-Travel & Branches    |  |  - ioctl Atomic Regions (REQ-3)     |
 +------------------------------------+  +-------------------------------------+
          |                                                       |
@@ -32,14 +32,14 @@ volumes with a Git-compatible remote.
          |                              |  - L0 / L1 Encrypted Local Journal  |
          |                              |  - Op-Log Elision & Coalescing      |
          |                              |  - CAS Writer Leases & Conflict Log |
-         |                              |  - OBEX Encryption & Signed Commits      |
+         |                              |  - OBEX Encryption & Signed Commits |
          |                              +-------------------------------------+
          |                                                       |
          |                              +-------------------------------------+
          |                              |     octoblock-fs (OBF1 Core)        |
          |                              |  - 4 KiB CoW B+Trees (Inode/Dentry) |
          |                              |  - Extents, Inline Data & Xattrs    |
-         |                              |  - Orphan Recovery & Online fsck        |
+         |                              |  - Orphan Recovery & Online fsck    |
          |                              +-------------------------------------+
          |                                                       |
          +---------------------------+---------------------------+
