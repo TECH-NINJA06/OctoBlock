@@ -1,8 +1,57 @@
-# OctoPage
+# OctoPage and OctoBlock
 
 OctoPage is an embedded relational database that uses a GitHub repository as its
 storage layer. It provides SQL, transactions, branching, time-travel queries,
 and database tooling while storing database state in ordinary Git objects.
+
+OctoBlock extends the same Git-backed storage model to a POSIX-style file
+system. It provides a copy-on-write file-system core, a durable write-back
+engine, and control-plane and FUSE-facing layers for synchronizing mounted
+volumes with a Git-compatible remote.
+
+## Architecture
+
+```text
++-----------------------------------------------------------------------------+
+|                        Applications / POSIX Workloads                       |
++------------------------------------+----------------------------------------+
+                                     |
+         +---------------------------+---------------------------+
+         |                                                       |
+         v (SQL / DB-API / N-API / FFI / HTTP)                   v (POSIX / FUSE / CLI)
++------------------------------------+  +-------------------------------------+
+|             OctoPage               |  |       OctoBlock VFS & Daemon        |
+|  - SQLite VFS & Catalog            |  |  - FuseDispatcher & VfsSession      |
+|  - Serializable Rebase & Replay    |  |  - Virtual /.octoblock/ Namespace  |
+|  - AS OF Time-Travel & Branches    |  |  - ioctl Atomic Regions (REQ-3)     |
++------------------------------------+  +-------------------------------------+
+         |                                                       |
+         |                              +-------------------------------------+
+         |                              |    octoblock-wb (Write-Back Engine) |
+         |                              |  - Path-Class Router (policy.toml)  |
+         |                              |  - L0 / L1 Encrypted Local Journal  |
+         |                              |  - Op-Log Elision & Coalescing      |
+         |                              |  - CAS Writer Leases & Conflict Log |
+         |                              |  - OBEX Encryption & Signed Commits      |
+         |                              +-------------------------------------+
+         |                                                       |
+         |                              +-------------------------------------+
+         |                              |     octoblock-fs (OBF1 Core)        |
+         |                              |  - 4 KiB CoW B+Trees (Inode/Dentry) |
+         |                              |  - Extents, Inline Data & Xattrs    |
+         |                              |  - Orphan Recovery & Online fsck        |
+         |                              +-------------------------------------+
+         |                                                       |
+         +---------------------------+---------------------------+
+                                     |
+                                     v
++-----------------------------------------------------------------------------+
+|                      octopage-git (Git Transport Layer)                     |
+|  - 3-Level Fanout Page Trees (pages/aa/bb/cc) & Canonical Changelogs        |
+|  - Atomic Ref CAS (refs/heads/*, refs/octopage/lease, refs/tags/octoblock/*)|
+|  - Smart HTTP / GitHub REST / Raw CDN / Fault-Injection Testkit             |
++-----------------------------------------------------------------------------+
+```
 
 ## What it does
 
@@ -53,6 +102,8 @@ written to the repository.
   SQLite compiled to WebAssembly and GitHub's raw-content CDN.
 - **Dashboard and SDKs:** Provide a web interface and TypeScript/Python clients
   for the hosted service.
+- **OctoBlock file system:** Store files and directories in an `OBF1` volume,
+  journal local changes, coalesce writes, and commit generations to Git.
 
 The repository is also useful as a development reference: the [project
 layout](#layout) shows where the engine, bindings, service, browser client,
@@ -91,6 +142,117 @@ database that never leaves the machine. `.help` lists the dot commands.
   `.branches` lists them. Open a branch with `--branch refs/heads/feature`.
 - **Signed commits:** `--sign-with ~/.ssh/id_ed25519` signs every commit; register the key on GitHub as a
   signing key to see them verified.
+
+## The OctoBlock file system
+
+OctoBlock is organized as a layered file-system stack:
+
+1. **`octoblock-fs` (Layer 3)** implements the `OBF1` on-disk format, copy-on-write
+   B+trees for inodes, dentries, extents, xattrs and orphans, page allocation,
+   canonical JSONL operation logs, `mkfs`, `fsck`, and an in-memory reference
+   model.
+2. **`octoblock-wb` (Layer 4)** provides the write-back engine over a Git
+   transport. It journals changes locally, coalesces and elides operations,
+   groups commits, recovers after crashes, and applies path persistence policy.
+3. **The daemon/VFS layer (Layer 5)** exposes inode-addressed FUSE operations
+   such as lookup, getattr, readdir, open, read, write, rename, unlink, flush,
+   and statfs. A background tick flushes dirty data and refreshes follower
+   mounts.
+
+### OctoBlock features
+
+- **Git-backed persistence:** committed volume generations are represented by
+  Git objects and refs, using the existing `octopage-git` transport.
+- **Copy-on-write file system:** directories, files, extents, xattrs, hard-link
+  limits, rename flags, sparse/unwritten extents, and POSIX-style errors are
+  tracked in the `OBF1` page format.
+- **Durable write-back modes:** `strict` waits for a remote `L2` commit on
+  `fsync`, `balanced` (the default) waits for a local journal `L1` barrier,
+  and `relaxed` keeps `fsync` at `L0` while background flushes run.
+- **Crash-safe encrypted journal:** local journal records use checksums,
+  segment rotation, recovery, and optional authenticated encryption. A full
+  journal can fail with `ENOSPC` or transition the mount read-only.
+- **Path-class persistence policy:** paths can be `persist`, `local`,
+  `volatile`, or `exclude`. Volume policies live in
+  `.octoblock/policy.toml`, while machine-local overrides may only make a path
+  less persistent.
+- **Multi-writer coordination:** writer leases and fencing prevent stale
+  mounts from pushing after lease loss. Conflict detection records logical
+  replay conflicts and exposes them through
+  `.octoblock/conflicts/index.json`.
+- **Branches and snapshots:** create and switch branches, create named
+  snapshots, resolve historical views, and merge a source branch from a
+  supplied base commit.
+- **Quota and history management:** live bytes are charged against a soft
+  budget (800 MiB by default), and `compact` archives an old generation before
+  writing a squashed continuation.
+- **Integrity and authenticity:** `fsck` validates the volume, remote page
+  envelopes can be encrypted, commit metadata can be signed, and pinned
+  signer fingerprints protect against unauthorized history.
+- **Operational status:** mounts report state, role, durability, journal
+  depth, remote head, epoch, quota usage, and lease information through
+  `.octoblock/status` and JSON output.
+
+### OctoBlock control plane
+
+The `octoblock` binary provides the control-plane command surface:
+
+```text
+octoblock status [--json]
+octoblock sync
+octoblock compact [--no-archive]
+octoblock branch list
+octoblock branch create <name>
+octoblock branch switch <name>
+octoblock snapshot list
+octoblock snapshot create <name>
+octoblock merge <source-branch> <base-commit-sha>
+octoblock lease status
+octoblock lease break
+octoblock conflicts
+octoblock fsck
+```
+
+For example, the workspace binary can be exercised with:
+
+```powershell
+cargo run --release -p octoblock-wb -- status --json
+cargo run --release -p octoblock-wb -- branch list
+cargo run --release -p octoblock-wb -- snapshot create before-migration
+cargo run --release -p octoblock-wb -- compact
+```
+
+The binary is the control-plane and dispatcher integration point; the
+underlying `WriteBackEngine`, `FuseDispatcher`, `PolicyEngine`, lease manager,
+conflict log, and compaction APIs are also available to Rust callers for
+embedding in a mount daemon.
+
+### OctoBlock persistence policy
+
+An `OBF1` volume can define rules in `.octoblock/policy.toml`:
+
+```toml
+[[rule]]
+match = "/**"
+class = "persist"
+
+[[rule]]
+match = "/tmp/**"
+class = "volatile"
+
+[[rule]]
+match = "/var/cache/**"
+class = "local"
+
+[[rule]]
+match = "/secrets/**"
+class = "exclude"
+```
+
+`persist` is journaled and committed to the remote, `local` is kept in a
+machine-local sidecar, `volatile` is memory-only, and `exclude` rejects access.
+The built-in Tier 1 policy provides common `/tmp`, `/run`, cache, and log
+defaults; Tier 0 persists all user paths.
 
 ## Using the API
 
@@ -262,6 +424,8 @@ Locally, the full gate is
 
 ```
 crates/            Rust workspace (engine crates are added phase by phase)
+  octoblock-fs/       OBF1 file-system core: copy-on-write trees, pages, fsck, and reference model
+  octoblock-wb/       write-back engine, journal, policy, leases, conflicts, compaction, VFS, daemon, CLI
   octopage-git/        git objects, packfiles, and the GitHub transport (push, fetch, refs, REST, CDN)
   octopage-pagestore/  pages in git blobs, the fan-out page map, caches, transactions, rebase, staging
   octopage-kv/         a key-value store on the page store, the octopage-kv CLI, and the soak test
@@ -290,8 +454,10 @@ tools/             Development tools; local_git_remote.py serves a GitHub-shaped
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo test -p octoblock-fs -p octoblock-wb
 python spike/octospike.py selftest
 ```
 
 The binding, SDK, browser and dashboard tests need Python 3.9+, Node 22+, a C compiler, and Edge or Chrome. They
-run `npm install` in `web/octopage-browser`, `web/dashboard` and `sdk/typescript` the first time.
+run `npm install` in `web/octopage-browser`, `web/dashboard` and `sdk/typescript` the first time. OctoBlock's
+multi-node chaos and end-to-end stress coverage is included in the `octoblock-wb` test suite.
