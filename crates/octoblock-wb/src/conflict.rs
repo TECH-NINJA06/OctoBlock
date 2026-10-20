@@ -1,53 +1,36 @@
-//! Section 7.3 Multi-writer logical replay, precondition verification, and conflict records
-//! (`/.octoblock/conflicts/`, `REQ-4`).
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use octoblock_fs::oplog::{OpKind, OpRecord};
 use serde::{Deserialize, Serialize};
 
-/// Maximum consecutive lost compare-and-swap races before transitioning to `MountState::Contended` (Section 7.3, 11.2).
 pub const MAX_CONSECUTIVE_RACES: u32 = 8;
 
-/// Reason a replayed operation could not be applied cleanly onto the new remote head (Section 7.3).
+/// Reason a replayed operation could not be applied cleanly onto the new remote head
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictReason {
-    /// Both mounts created an entry with the same name in the same parent directory.
     CreateCollision,
-    /// Both mounts modified the data or size of the same file concurrently.
     ConcurrentModify,
-    /// The target file or directory was unlinked on the remote while modified locally.
     ModifyDeleted,
-    /// A file modified on the remote was unlinked locally.
     DeleteModified,
-    /// A rename source or destination collided with a remote mutation.
     RenameCollision,
 }
 
-/// Machine-readable conflict record stored in `/.octoblock/conflicts/<batch>/index.json` (Section 7.3, REQ-4).
+/// Machine-readable conflict record stored in `/.octoblock/conflicts/<batch>/index.json`
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictRecord {
-    /// Conflict batch identifier (`<epoch>-mount-<id>`).
     pub batch_id: String,
-    /// Local journal sequence number of the conflicting operation.
     pub seq: u64,
-    /// Base commit SHA the operation was originally recorded against.
     pub base_commit: String,
-    /// Winning remote commit SHA that advanced the head.
     pub remote_commit: String,
-    /// Logical path affected by the conflict.
     pub path: String,
-    /// Path where the local conflicting bytes were preserved (`None` if no data payload).
     pub preserved_copy: Option<String>,
-    /// Reason the precondition failed.
     pub reason: ConflictReason,
 }
 
 /// Summary of all conflict batches recorded on the volume (`/.octoblock/conflicts/index.json`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictLog {
-    /// Recorded conflict entries in chronological order.
     pub records: Vec<ConflictRecord>,
 }
 
@@ -76,13 +59,9 @@ impl ConflictLog {
 /// Summary of remote mutations extracted from commits between `base_head` and `remote_head`.
 #[derive(Clone, Debug, Default)]
 pub struct RemoteDiffSummary {
-    /// Set of `(parent_ino, entry_name)` pairs created or renamed-into on the remote.
     pub created_names: BTreeSet<(u64, String)>,
-    /// Set of `(parent_ino, entry_name)` pairs unlinked on the remote.
     pub unlinked_names: BTreeSet<(u64, String)>,
-    /// Set of inodes whose data or size was modified on the remote.
     pub modified_inodes: BTreeSet<u64>,
-    /// Map of `(parent_ino, entry_name)` to `ino` from remote create ops.
     pub name_to_ino: BTreeMap<(u64, String), u64>,
 }
 

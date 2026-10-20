@@ -1,8 +1,6 @@
-//! OctoBlock Layer 3 File-System Core (`octoblock-fs`).
-//!
-//! Implements the `OBF1` on-disk format, copy-on-write B+trees (inode, dentry, extent, xattr,
-//! orphan), the 256-page group allocator, canonical JSONL changelog encoding, `mkfs`, `fsck`,
-//! `dump`, and the differential in-memory reference model.
+///Sorry for this abomination ;-;
+/// If anyone's couragious enough to read this, please consider refactoring it into smaller modules and files. 
+/// I did tell copilot to add comments for humans to understand, but it seems to have failed miserably.
 
 pub mod alloc;
 pub mod fsck;
@@ -25,41 +23,24 @@ use crate::tree::{
     encode_dentry_chain, merge_extents, normalize_name,
 };
 
-/// Root directory inode number.
 pub const ROOT_INO: u64 = 1;
-/// Maximum hard links per inode (Section 4.5 / 4.10).
 pub const MAX_NLINK: u32 = 65_000;
-/// Maximum file name component length in bytes (`NAME_MAX`).
 pub const MAX_NAME_LEN: usize = 255;
-/// Maximum file size default (`256 MiB`, Section 2.1).
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
-/// Default soft live-data budget (`800 MB`, Section 2.1).
 pub const DEFAULT_BUDGET_SOFT: u64 = 800 * 1024 * 1024;
-/// Maximum extended attribute value length (`4,096 B`, Section 4.10).
 pub const MAX_XATTR_VALUE: usize = 4096;
-/// Maximum total extended attribute bytes per inode (`64 KB`, Section 4.10).
 pub const MAX_XATTR_TOTAL: usize = 65_536;
 
-/// POSIX file type mask.
 pub const S_IFMT: u32 = 0o170_000;
-/// Regular file mode bit.
 pub const S_IFREG: u32 = 0o100_000;
-/// Directory mode bit.
 pub const S_IFDIR: u32 = 0o040_000;
-/// Symbolic link mode bit.
 pub const S_IFLNK: u32 = 0o120_000;
-/// FIFO mode bit.
 pub const S_IFIFO: u32 = 0o010_000;
-/// Character device mode bit.
 pub const S_IFCHR: u32 = 0o020_000;
-/// Block device mode bit.
 pub const S_IFBLK: u32 = 0o060_000;
-/// Socket mode bit.
 pub const S_IFSOCK: u32 = 0o140_000;
 
-/// Linux `renameat2` flag: do not overwrite an existing target.
 pub const RENAME_NOREPLACE: u32 = 1 << 0;
-/// Linux `renameat2` flag: atomically exchange source and target.
 pub const RENAME_EXCHANGE: u32 = 1 << 1;
 
 /// Appendix A POSIX `errno` codes returned by `octoblock-fs`.
@@ -116,9 +97,7 @@ pub enum Errno {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{errno:?}: {message}")]
 pub struct Error {
-    /// The POSIX errno value.
     pub errno: Errno,
-    /// Diagnostic explanation.
     pub message: String,
 }
 
@@ -138,24 +117,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Directory listing entry returned by `Volume::readdir`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirEntry {
-    /// Entry name bytes.
     pub name: Vec<u8>,
-    /// Target inode number.
     pub ino: u64,
-    /// POSIX `d_type` byte.
     pub file_type: u8,
-    /// Stable cookie for resuming `readdir` (`telldir`/`seekdir`, Section 4.6).
     pub cookie: u64,
 }
 
 /// Summary produced when `Volume::commit_group` finalizes a commit group.
 #[derive(Clone, Debug)]
 pub struct CommittedGroup {
-    /// New volume epoch.
     pub epoch: u64,
-    /// Canonical JSONL changelog bytes for the committed group.
     pub changelog: Bytes,
-    /// Number of operations recorded in the group.
     pub ops_count: usize,
 }
 
@@ -241,7 +213,7 @@ impl Volume {
         })
     }
 
-    /// Mount an existing `OBF1` page map and reclaim any orphan inodes from a previous crash (Section 4.8 & 6.9).
+    /// Mount an existing `OBF1` page map and reclaim any orphan inodes from a previous crash 
     pub fn mount(
         pages: BTreeMap<PageId, Bytes>,
         read_write: bool,
@@ -300,12 +272,12 @@ impl Volume {
         self.read_only = read_only;
     }
 
-    /// Set the `.octoblock/policy.toml` blob SHA in the superblock (Section 4.4).
+    /// Set the `.octoblock/policy.toml` blob SHA in the superblock
     pub fn set_policy_sha(&mut self, sha: Vec<u8>) {
         self.sb.policy_sha = sha;
     }
 
-    /// Update the 2-bit [`PathClass`] stored in an inode's flags (Section 5.3).
+    /// Update the 2-bit [`PathClass`] stored in an inode's flags 
     pub fn set_inode_path_class(&mut self, ino: u64, class: PathClass) -> Result<()> {
         let mut rec = self.getattr(ino)?;
         rec.set_path_class(class);
@@ -917,7 +889,7 @@ impl Volume {
         Ok(())
     }
 
-    /// Atomic rename supporting `0`, `RENAME_NOREPLACE`, and `RENAME_EXCHANGE` (Section 3.5, 5.3, 8).
+    /// Atomic rename supporting `0`, `RENAME_NOREPLACE`, and `RENAME_EXCHANGE`
     pub fn rename(
         &mut self,
         old_parent: u64,
@@ -1190,7 +1162,7 @@ impl Volume {
         Ok(())
     }
 
-    /// Reclaim all orphan inodes recorded in the orphan tree (Section 4.8 & 6.9).
+    /// Reclaim all orphan inodes recorded in the orphan tree 
     pub fn reclaim_orphans(&mut self) -> Result<usize> {
         let entries =
             self.orphan_tree()
@@ -1289,7 +1261,7 @@ impl Volume {
         Ok(out)
     }
 
-    /// Read up to `len` bytes from `ino` starting at `offset` (Section 3.5).
+    /// Read up to `len` bytes from `ino` starting at `offset`
     pub fn read(&self, ino: u64, offset: u64, len: usize) -> Result<Vec<u8>> {
         let rec = self.getattr(ino)?;
         if (rec.mode & S_IFMT) == S_IFDIR {
@@ -1334,7 +1306,7 @@ impl Volume {
         self.read(ino, 0, rec.size as usize)
     }
 
-    /// Write `data` to `ino` at `offset` (Section 3.5, 4.5, 4.7).
+    /// Write `data` to `ino` at `offset`
     pub fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
         self.write_internal(ino, offset, data, true)
     }
@@ -1371,7 +1343,7 @@ impl Volume {
         }
 
         let page_size = self.sb.page_size as usize;
-        let max_inline = page_size / 4; // 1,024 B at 4 KB (quarter-page rule, Section 4.5)
+        let max_inline = page_size / 4; // 1,024 B at 4 KB
         let new_size = rec.size.max(end_off);
 
         if new_size <= (max_inline as u64) && matches!(rec.data, InodeData::Inline(_)) {
@@ -1453,7 +1425,6 @@ impl Volume {
             pos += take;
 
             // Free any old physical page mapped at `p_idx`.
-            // Free any old physical page mapped at `p_idx`.
             for ext in &extents {
                 if p_idx >= ext.file_page
                     && p_idx < ext.end_page()
@@ -1498,7 +1469,7 @@ impl Volume {
         Ok(data.len())
     }
 
-    /// Resize `ino` to `new_size`, zeroing any partial tail page on shrink (Section 8, EC-Z04, EC-Z06).
+    /// Resize `ino` to `new_size`, zeroing any partial tail page on shrink
     pub fn truncate(&mut self, ino: u64, new_size: u64) -> Result<()> {
         if new_size > self.max_file_size {
             return Err(Error::new(Errno::EFBIG, "truncate exceeds max_file_size"));
@@ -1643,7 +1614,7 @@ impl Volume {
         Ok(())
     }
 
-    /// Punch a hole `[offset .. offset + len)` in `ino`, freeing full pages in that range (Section 8).
+    /// Punch a hole `[offset .. offset + len)` in `ino`, freeing full pages in that range
     pub fn punch_hole(&mut self, ino: u64, offset: u64, len: u64) -> Result<()> {
         self.check_writable(false)?;
         if len == 0 {
@@ -1740,7 +1711,7 @@ impl Volume {
         Ok(())
     }
 
-    /// Update inode attributes (`chmod`, `chown`, `utimens`, `chattr`, Section 8).
+    /// Update inode attributes
     #[allow(clippy::too_many_arguments)]
     pub fn setattr(
         &mut self,
@@ -1903,8 +1874,7 @@ impl Volume {
         Ok(())
     }
 
-    /// Finalize the current commit group, writing updated FreeMap pages and Page 0 Superblock (Section 6.2, REQ-1, REQ-11).
-    /// Finalize the current commit group, writing updated FreeMap pages and Page 0 Superblock (Section 6.2, REQ-1, REQ-11).
+    /// Finalize the current commit group, writing updated FreeMap pages and Page 0 Superblock
     pub fn commit_group(&mut self) -> Result<Option<CommittedGroup>> {
         if self.pending_ops.is_empty() {
             return Ok(None); // REQ-11: Empty groups MUST NOT be committed.
@@ -1979,7 +1949,7 @@ mod tests {
     use crate::oplog::decode_changelog;
 
     #[test]
-    fn phase_b_edge_cases_and_orphans() {
+    fn edge_cases_and_orphans() {
         let mut vol = Volume::mkfs(4096, [0xAB; 16], CasePolicy::Sensitive, 1).unwrap();
 
         // EC-N01: 255-byte name works; 256-byte name returns ENAMETOOLONG.
@@ -2019,17 +1989,17 @@ mod tests {
     }
 
     #[test]
-    fn phase_b_differential_model_3000_steps() {
+    fn differential_model_3000_steps() {
         run_differential_model(3_000, 0x0C70_B10C).unwrap();
     }
 
     #[test]
-    fn phase_b_crash_injection_1000_points() {
+    fn injection_1000_points() {
         run_crash_injection_suite(1_000, 0xCAFE_BABE).unwrap();
     }
 
     #[test]
-    fn phase_b_fsck_detect_and_repair() {
+    fn fsck_detect_and_repair() {
         let mut vol = Volume::mkfs(4096, [0x77; 16], CasePolicy::Sensitive, 1).unwrap();
         let ino = vol.create(ROOT_INO, b"check.txt", 0o644, 1000, 1000).unwrap();
         vol.write(ino, 0, &vec![0x33; 8192]).unwrap();
@@ -2060,7 +2030,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_b_fsx_suite() {
+    fn fsx_suite() {
         run_fsx(500, 20_261_018).unwrap();
     }
 }

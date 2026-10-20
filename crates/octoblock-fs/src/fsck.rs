@@ -1,5 +1,3 @@
-//! Section 16.1 & 18.9 File-system consistency checker (`fsck`) and repair engine.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::page::{MetaPage, PageId, PageType};
@@ -28,7 +26,7 @@ impl FsckReport {
 
 impl Volume {
     /// Walk all trees from the superblock; verify headers, extents, link counts, orphans,
-    /// free-map bits, and live counters (Section 16.1 & 18.9).
+    /// free-map bits, and live counters
     pub fn fsck(&mut self, repair: bool) -> Result<FsckReport> {
         let mut report = FsckReport::default();
         let page_size = self.sb.page_size as usize;

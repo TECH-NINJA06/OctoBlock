@@ -1,6 +1,3 @@
-//! Section 6.4 Append-only local write-ahead journal (`journal/`), CRC32C framing,
-//! torn-tail recovery (`EC-D08`), and subkey encryption (`REQ-8`).
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -13,14 +10,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-/// Default segment file size: 64 MiB (Section 3.4, 6.4).
+/// Default segment file size: 64 MiB 
 pub const SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
-/// Default total journal capacity: 1 GiB (Section 6.4, Appendix B).
+/// Default total journal capacity: 1 GiB 
 pub const DEFAULT_JOURNAL_CAPACITY: u64 = 1024 * 1024 * 1024;
 const RECORD_HEADER_LEN: usize = 4 + 4 + 8 + 1; // len(u32) + crc32c(u32) + seq(u64) + type(u8)
 const NONCE_LEN: usize = 24;
 
-/// Behavior when the local journal reaches `journal_capacity` (Section 6.4, Appendix B).
+/// Behavior when the local journal reaches `journal_capacity` 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OnJournalFull {
@@ -62,7 +59,7 @@ pub struct JournalEntry {
     pub kind: JournalRecordType,
     /// Logged file-system mutation.
     pub op: OpRecord,
-    /// Full data bytes for `write`/`symlink` ops (Section 6.4: data pages are included in full).
+    /// Full data bytes for `write`/`symlink` ops 
     pub data: Vec<u8>,
 }
 
@@ -88,7 +85,7 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
     !crc
 }
 
-/// Derive a 32-byte journal subkey from the volume's master data key (Section 6.4, 12.2, REQ-8).
+/// Derive a 32-byte journal subkey from the volume's master data key
 pub fn derive_journal_subkey(master_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let mut hasher = Sha256::new();
     hasher.update(b"octoblock-journal-subkey-v1:");

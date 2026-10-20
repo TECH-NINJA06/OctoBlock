@@ -1,3 +1,6 @@
+///Sorry for this abomination ;-;
+/// If anyone's couragious enough to read this, please consider refactoring it into smaller modules and files. 
+
 pub mod branch;
 pub mod cli;
 pub mod coalesce;
@@ -2347,7 +2350,7 @@ mod tests {
     use octopage_git::{Fault, InMemory};
 
     #[tokio::test]
-    async fn phase_c_pjdfstest_supported_set_and_policy_classes() {
+    async fn pjdfstest_supported_set_and_policy_classes() {
         let remote = Arc::new(InMemory::new());
         let dir = tempfile::tempdir().unwrap();
         let cfg = EngineConfig {
@@ -2440,7 +2443,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase_c_5000_crash_injection_points() {
+    async fn crash_injection_5000_points() {
         let remote = Arc::new(InMemory::new());
         let dir = tempfile::tempdir().unwrap();
         let cfg = EngineConfig {
@@ -2525,7 +2528,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase_d_writer_lease_cas_and_follower_demotion() {
+    async fn writer_lease_cas_and_follower_demotion() {
         let remote = Arc::new(InMemory::new());
         let dir1 = tempfile::tempdir().unwrap();
         let dir2 = tempfile::tempdir().unwrap();
@@ -2581,7 +2584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase_d_fencing_on_expiry_and_lease_break_rebase() {
+    async fn fencing_on_expiry_and_lease_break_rebase() {
         let remote = Arc::new(InMemory::new());
         let dir1 = tempfile::tempdir().unwrap();
         let dir2 = tempfile::tempdir().unwrap();
@@ -2654,7 +2657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase_d_multi_writer_replay_and_conflict_records() {
+    async fn multi_writer_replay_and_conflict_records() {
         let remote = Arc::new(InMemory::new());
         let dir1 = tempfile::tempdir().unwrap();
         let dir2 = tempfile::tempdir().unwrap();
@@ -2722,7 +2725,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase_d_follower_close_to_open_coherence() {
+    async fn follower_close_to_open_coherence() {
         let remote = Arc::new(InMemory::new());
         let dir_w = tempfile::tempdir().unwrap();
         let dir_f = tempfile::tempdir().unwrap();
@@ -2773,7 +2776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase_d_branches_snapshots_time_travel_and_merge() {
+    async fn branches_snapshots_time_travel_and_merge() {
         let remote = Arc::new(InMemory::new());
         let dir = tempfile::tempdir().unwrap();
         let dir_as_of = tempfile::tempdir().unwrap();
@@ -2843,7 +2846,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn phase_e_remote_page_encryption_and_tamper_detection() {
+    async fn remote_page_encryption_and_tamper_detection() {
         let remote = Arc::new(InMemory::new());
         let dir1 = tempfile::tempdir().unwrap();
         let dir2 = tempfile::tempdir().unwrap();
@@ -2893,7 +2896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase_e_commit_signing_pinned_signers_and_anti_rollback() {
+    async fn commit_signing_pinned_signers_and_anti_rollback() {
         let remote = Arc::new(InMemory::new());
         let dir1 = tempfile::tempdir().unwrap();
         let dir2 = tempfile::tempdir().unwrap();
@@ -2956,7 +2959,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase_e_quota_budget_and_history_compaction() {
+    async fn quota_budget_and_history_compaction() {
         let remote = Arc::new(InMemory::new());
         let dir = tempfile::tempdir().unwrap();
 
@@ -3007,7 +3010,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn phase_f_vfs_virtual_namespace_ioctls_and_cli_commands() {
+    async fn vfs_virtual_namespace_ioctls_and_cli_commands() {
         use crate::cli::{CliCommand, execute_cli};
         use crate::vfs::{
             OBX_IOC_ATOMIC_BEGIN, OBX_IOC_ATOMIC_END, VINO_OCTOBLOCK_DIR, VfsSession,
@@ -3079,7 +3082,7 @@ mod tests {
         assert!(fsck_out.contains("fsck clean=true"));
     }
     #[tokio::test]
-    async fn phase_g_fuse_inode_dispatcher_and_daemon_background_ticks() {
+    async fn fuse_inode_dispatcher_and_daemon_background_ticks() {
         use crate::daemon::FuseDispatcher;
         use crate::vfs::OBX_IOC_SYNC_L2;
 
@@ -3163,7 +3166,7 @@ mod tests {
         writer_daemon.shutdown().await.unwrap();
     }
     #[tokio::test]
-    async fn phase_h_multi_node_chaos_stress_and_end_to_end_verification() {
+    async fn multi_node_chaos_stress_and_end_to_end_verification() {
         let remote = Arc::new(InMemory::new());
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();

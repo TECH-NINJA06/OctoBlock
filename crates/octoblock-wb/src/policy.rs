@@ -1,15 +1,11 @@
-//! Section 5 Path classes and persistence policy (`.octoblock/policy.toml`).
-
 use octoblock_fs::page::PathClass;
 use octoblock_fs::{Errno, Error, Result};
 use serde::{Deserialize, Serialize};
 
-/// A single glob rule mapping matching paths to a [`PathClass`] (Section 5.2).
+/// A single glob rule mapping matching paths to a [`PathClass`]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyRule {
-    /// Gitignore-style glob pattern (e.g. `"/tmp/**"`, `"**/.cache/**"`).
     pub pattern: String,
-    /// Target persistence class.
     pub class: PathClassSpec,
 }
 
@@ -61,7 +57,7 @@ impl PathClassSpec {
     }
 }
 
-/// Volume persistence policy with optional stricter machine-local overrides (Section 5.2, EC-L03).
+/// Volume persistence policy with optional stricter machine-local overrides
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyEngine {
     /// Versioned rules from `.octoblock/policy.toml`.
@@ -72,7 +68,7 @@ pub struct PolicyEngine {
 }
 
 impl PolicyEngine {
-    /// Default Tier 0 policy: everything `persist` except `.octoblock/` internals (Section 5.4).
+    /// Default Tier 0 policy: everything `persist` except `.octoblock/` internals
     pub fn tier0_default() -> Self {
         PolicyEngine {
             rules: vec![PolicyRule {
@@ -83,7 +79,7 @@ impl PolicyEngine {
         }
     }
 
-    /// Default Tier 1 persistent-state overlay policy (Section 5.2, 5.4).
+    /// Default Tier 1 persistent-state overlay policy 
     pub fn tier1_default() -> Self {
         PolicyEngine {
             rules: vec![

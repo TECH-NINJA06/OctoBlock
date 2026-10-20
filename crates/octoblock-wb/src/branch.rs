@@ -63,28 +63,21 @@ struct RefInfoHelperHex {
     commit_id: String,
 }
 
-/// Prefix for named OctoBlock snapshots (Section 9.2).
 pub const SNAPSHOT_TAG_PREFIX: &str = "refs/tags/octoblock/";
-/// Prefix for standard Git branches (Section 9.1).
 pub const BRANCH_REF_PREFIX: &str = "refs/heads/";
-
-/// Encode a `(snapshot_slot, local_ino)` pair into a 64-bit namespaced inode number (Section 9.4).
 ///
-/// Live volume inodes always have `snapshot_slot == 0` (high 16 bits zero).
-/// Virtual `.octoblock/snapshots/<id>/` inodes set the high 16 bits to `slot >= 1` so kernel VFS
-/// caches never confuse a historical inode with a live inode.
 pub const fn encode_snapshot_ino(slot: u16, local_ino: u64) -> u64 {
     ((slot as u64) << 48) | (local_ino & 0x0000_FFFF_FFFF_FFFF)
 }
 
-/// Decode a 64-bit inode number into `(snapshot_slot, local_ino)` (Section 9.4).
+/// Decode a 64-bit inode number into `(snapshot_slot, local_ino)`
 pub const fn decode_snapshot_ino(ino: u64) -> (u16, u64) {
     let slot = (ino >> 48) as u16;
     let local = ino & 0x0000_FFFF_FFFF_FFFF;
     (slot, local)
 }
 
-/// Tracks open file handles and their pinned commit SHAs for close-to-open follower coherence (Section 7.4).
+/// Tracks open file handles and their pinned commit SHAs for close-to-open follower coherence
 #[derive(Clone, Debug, Default)]
 pub struct OpenFileTable {
     next_fh: u64,
@@ -120,7 +113,7 @@ impl OpenFileTable {
     }
 }
 
-/// Create a zero-copy branch `refs/heads/<branch_name>` pointing at `from_commit` in one round trip (Section 9.1).
+/// Create a zero-copy branch `refs/heads/<branch_name>` pointing at `from_commit` in one round trip
 pub async fn create_branch<T: Transport>(
     transport: &T,
     branch_name: &str,
@@ -160,7 +153,7 @@ pub async fn list_branches<T: Transport>(transport: &T) -> Result<Vec<RefInfo>> 
         .collect())
 }
 
-/// Create a named immutable snapshot `refs/tags/octoblock/<snapshot_name>` at `commit_id` (Section 9.2).
+/// Create a named immutable snapshot `refs/tags/octoblock/<snapshot_name>` at `commit_id`
 pub async fn create_snapshot<T: Transport>(
     transport: &T,
     snapshot_name: &str,
@@ -200,7 +193,7 @@ pub async fn list_snapshots<T: Transport>(transport: &T) -> Result<Vec<RefInfo>>
         .collect())
 }
 
-/// Selector for time-travel mounts (`--as-of`, Section 9.3).
+/// Selector for time-travel mounts
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AsOfSelector {
     /// Exact commit SHA.
@@ -211,7 +204,7 @@ pub enum AsOfSelector {
     Timestamp(i64),
 }
 
-/// Resolve an [`AsOfSelector`] to a concrete `ObjectId` commit on `transport` (Section 9.3).
+/// Resolve an [`AsOfSelector`] to a concrete `ObjectId` commit on `transport`
 pub async fn resolve_as_of<T: Transport>(
     transport: &T,
     branch_ref: &str,

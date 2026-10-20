@@ -9,7 +9,7 @@ use octoblock_wb::policy::PolicyEngine;
 use octoblock_wb::{EngineConfig, WriteBackEngine};
 use octopage_git::InMemory;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let raw_args: Vec<String> = env::args().skip(1).collect();
     if raw_args.is_empty() || raw_args[0] == "--help" || raw_args[0] == "-h" {

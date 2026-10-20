@@ -1,6 +1,3 @@
-//! Section 4.9 Page and Inode Allocator: 256-page allocation groups, free-map bitmaps,
-//! reachability guards (EC-D05), and 65,536-inode reservation ranges.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
@@ -10,7 +7,7 @@ use crate::{Errno, Error, Result};
 
 /// Pages per allocation group (1 fan-out leaf = 256 pages = 1 MiB at 4 KB).
 pub const GROUP_PAGES: u32 = 256;
-/// Number of inodes reserved at a time by a mount (Section 4.9).
+/// Number of inodes reserved at a time by a mount
 pub const INO_RANGE_SIZE: u64 = 65_536;
 
 /// A reserved half-open inode range `[start, end_inclusive]`.
@@ -85,11 +82,8 @@ pub struct PageAllocator {
     first_usable: u32,
     preferred_group: u32,
     cursor: u32,
-    /// Set of all currently allocated non-system pages (`first_usable..=MAX_PAGE_ID`).
     used: BTreeSet<u32>,
-    /// Pages reachable in the base snapshot that must not be overwritten in-place (CoW + EC-D05).
     protected_base: BTreeSet<u32>,
-    /// Maximum page ID allocated so far, to bound free-map page materialization.
     high_water: u32,
 }
 
@@ -189,7 +183,7 @@ impl PageAllocator {
         Ok(run.pop().expect("run of 1"))
     }
 
-    /// Allocate up to `count` contiguous page IDs inside a 256-page group (Section 4.9).
+    /// Allocate up to `count` contiguous page IDs inside a 256-page group
     pub fn allocate_run(&mut self, count: usize) -> Result<Vec<PageId>> {
         let want = count.max(1) as u32;
         if let Some(run) = self.find_contiguous(self.cursor, MAX_PAGE_ID, want) {

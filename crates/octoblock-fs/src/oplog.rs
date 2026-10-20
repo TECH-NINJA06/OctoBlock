@@ -1,5 +1,3 @@
-//! Appendix C Operation record and canonical JSON Lines (`jsonl`) changelog encoding.
-
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -8,139 +6,91 @@ use crate::{Errno, Error, Result};
 /// Data page run reference inside a `write` op (`{"file_page": 0, "count": 2}`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageRunRef {
-    /// Starting logical page index inside the file.
     pub file_page: u32,
-    /// Number of pages written by the operation.
     pub count: u32,
 }
 
-/// Specific file-system operation payload (Section 6.1 & Appendix C).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpKind {
-    /// Create a regular file, directory, symlink, or device node.
     Create {
-        /// Kind of create (`create`, `mkdir`, `symlink`, `mknod`).
         op_name: String,
-        /// Parent directory inode number.
         parent: u64,
-        /// Entry name in parent.
         name: String,
-        /// File mode (`S_IFMT | perm`).
         mode: u32,
-        /// Reserved inode range `[start, end_inclusive]`.
         ino_range: [u64; 2],
-        /// Allocated inode number.
         ino: u64,
-        /// Optional symlink target or device `rdev`.
         target: Option<String>,
     },
     /// Create a hard link.
     Link {
-        /// Existing target inode number.
         ino: u64,
-        /// New parent directory inode.
         parent: u64,
-        /// New entry name.
         name: String,
     },
     /// Unlink a file or remove an empty directory (`unlink` or `rmdir`).
     Unlink {
-        /// `"unlink"` or `"rmdir"`.
         op_name: String,
-        /// Parent directory inode.
         parent: u64,
-        /// Entry name removed.
         name: String,
-        /// Expected child inode number.
         ino: u64,
     },
     /// Atomic rename (`rename`).
     Rename {
-        /// Old `(parent_ino, name)`.
         old: (u64, String),
-        /// New `(parent_ino, name)`.
         new: (u64, String),
-        /// Rename flags (`RENAME_NOREPLACE`, `RENAME_EXCHANGE`, `RENAME_WHITEOUT`).
         flags: u32,
     },
     /// Write bytes into a file (`write`).
     Write {
-        /// Target file inode.
         ino: u64,
-        /// Byte offset.
         off: u64,
-        /// Byte length written.
         len: u64,
-        /// Referenced data page run in the commit.
         pages: PageRunRef,
-        /// Resulting file size after the write.
         size: u64,
     },
     /// Truncate, `fallocate`, or `punch_hole`.
     Truncate {
-        /// `"truncate"`, `"fallocate"`, or `"punch_hole"`.
         op_name: String,
-        /// Target file inode.
         ino: u64,
-        /// Offset (0 for `truncate`).
         off: u64,
-        /// New size or range length.
         size: u64,
-        /// Mode flags for `fallocate`.
         mode: u32,
     },
     /// Update inode attributes (`setattr`).
     Setattr {
-        /// Target inode.
         ino: u64,
-        /// Optional new mode.
         mode: Option<u32>,
-        /// Optional new uid.
         uid: Option<u32>,
-        /// Optional new gid.
         gid: Option<u32>,
-        /// Optional new size.
         size: Option<u64>,
-        /// Optional new mtime (ns).
         mtime: Option<i64>,
-        /// Optional new flags (`IMMUTABLE`, `APPEND`).
         flags: Option<u32>,
     },
     /// Set or remove an extended attribute (`setxattr` / `removexattr`).
     Xattr {
-        /// `"setxattr"` or `"removexattr"`.
         op_name: String,
-        /// Target inode.
         ino: u64,
-        /// Attribute name.
         name: String,
-        /// Attribute value length (or `None` on remove).
         value_len: Option<usize>,
     },
     /// Group boundary or atomic-region barrier (`barrier`).
     Barrier {
-        /// `"group_end"`, `"atomic_begin"`, or `"atomic_end"`.
         kind: String,
     },
 }
 
-/// One logged mutation in the volume changelog (Appendix C).
+/// One logged mutation in the volume changelog
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpRecord {
-    /// Monotonic sequence number within the volume.
     pub seq: u64,
-    /// Client timestamp in seconds (recorded for deterministic replay).
     pub t: f64,
-    /// Caller user ID.
     pub uid: u32,
-    /// Caller group ID.
     pub gid: u32,
-    /// Specific operation details.
     pub kind: OpKind,
 }
 
 impl OpRecord {
-    /// Encode as a single canonical JSON line with keys in Appendix C's deterministic order.
+    /// Encode as a single canonical JSON line with keys in deterministic order.
     pub fn to_json_line(&self) -> String {
         let mut m = Map::new();
         m.insert("seq".into(), Value::from(self.seq));

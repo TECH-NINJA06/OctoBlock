@@ -1,5 +1,3 @@
-//! Copy-on-write slotted B+trees and record encodings for inodes, dentries, extents, xattrs, and orphans.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
@@ -11,21 +9,12 @@ use crate::page::{
 };
 use crate::{Errno, Error, Result};
 
-// --------------------------------------------------------------------------- Inode flags & constants
-
-/// Inode is immutable (`chattr +i`, EC-I06).
 pub const INO_IMMUTABLE: u32 = 1 << 0;
-/// Inode is append-only (`chattr +a`, EC-I06).
 pub const INO_APPEND: u32 = 1 << 1;
-/// File or symlink data is stored inline inside the inode record (up to `page_size / 4`).
 pub const INO_INLINE: u32 = 1 << 2;
-/// File has more than 6 extents and uses a dedicated per-file extent B+tree (EC-Z07).
 pub const INO_EXTENT_TREE: u32 = 1 << 3;
-/// Inode failed an integrity check (`EIO` on read).
 pub const INO_DAMAGED: u32 = 1 << 4;
-/// Bit shift for the 2-bit `PathClass` in `inode.flags` (Section 5.3).
 pub const INO_CLASS_SHIFT: u32 = 5;
-/// Exclude from backup dumps.
 pub const INO_NODUMP: u32 = 1 << 7;
 
 /// Maximum inline extents stored directly inside an inode before flipping to `EXTENT_TREE`.
@@ -33,25 +22,16 @@ pub const MAX_INLINE_EXTENTS: usize = 6;
 
 // --------------------------------------------------------------------------- Extent flags & records
 
-/// Extent represents a sparse hole (no page allocated; reads as zeroes).
 pub const EXT_HOLE: u8 = 1 << 0;
-/// Extent was preallocated via `fallocate` (`UNWRITTEN`; reads as zeroes).
 pub const EXT_UNWRITTEN: u8 = 1 << 1;
-/// Extent pages are compressed.
 pub const EXT_COMPRESSED: u8 = 1 << 2;
-/// Extent pages are encrypted.
 pub const EXT_ENCRYPTED: u8 = 1 << 3;
 
-/// Section 4.7 Extent mapping `[file_page .. file_page + len)` to `[page_id .. page_id + len)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Extent {
-    /// Starting file page offset (`offset / page_size`).
     pub file_page: u32,
-    /// Starting 24-bit page ID (`0` when `EXT_HOLE` is set).
     pub page_id: PageId,
-    /// Number of contiguous pages in this extent.
     pub len: u16,
-    /// Extent flags (`EXT_HOLE`, `EXT_UNWRITTEN`, `EXT_COMPRESSED`, `EXT_ENCRYPTED`).
     pub flags: u8,
 }
 
@@ -118,7 +98,7 @@ pub fn merge_extents(extents: &mut Vec<Extent>) {
     *extents = merged;
 }
 
-/// Payload union stored inside an `InodeRecord` (Section 4.5).
+/// Payload union stored inside an `InodeRecord`
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InodeData {
     /// Inline file or symlink bytes up to `page_size / 4` (1,024 B at 4 KB).
@@ -132,37 +112,21 @@ pub enum InodeData {
 /// Section 4.5 Inode record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InodeRecord {
-    /// 64-bit persistent inode number.
     pub ino: u64,
-    /// File type and permissions (`S_IFMT | perm`).
     pub mode: u32,
-    /// Hard link count (capped at 65,000).
     pub nlink: u32,
-    /// Owner user ID.
     pub uid: u32,
-    /// Owner group ID.
     pub gid: u32,
-    /// Device number (for character/block device nodes).
     pub rdev: u64,
-    /// Logical file size in bytes.
     pub size: u64,
-    /// Number of allocated pages (excluding holes).
     pub blocks: u64,
-    /// Access time in nanoseconds since the Unix epoch.
     pub atime: i64,
-    /// Modification time in nanoseconds since the Unix epoch.
     pub mtime: i64,
-    /// Status-change time in nanoseconds since the Unix epoch.
     pub ctime: i64,
-    /// Birth/creation time in nanoseconds since the Unix epoch.
     pub btime: i64,
-    /// Inode flags (`INO_IMMUTABLE`, `INO_APPEND`, `INO_INLINE`, `INO_EXTENT_TREE`, class bits).
     pub flags: u32,
-    /// Generation number (bumped if reused after `fsck` repair).
     pub generation: u64,
-    /// Optional xattr B+tree root or leaf page ID.
     pub xattr_root: Option<PageId>,
-    /// Inline bytes, inline extents, or extent-tree root pointer.
     pub data: InodeData,
 }
 
@@ -306,7 +270,7 @@ impl InodeRecord {
 
 // --------------------------------------------------------------------------- Directory entries
 
-/// Normalize a file name according to the volume's `CasePolicy` (Section 4.6, EC-N05).
+/// Normalize a file name according to the volume's `CasePolicy`
 pub fn normalize_name(name: &[u8], policy: CasePolicy) -> Vec<u8> {
     match policy {
         CasePolicy::Sensitive => name.to_vec(),
@@ -329,16 +293,12 @@ pub fn dentry_hash(uuid: &[u8; 16], name: &[u8], policy: CasePolicy) -> u64 {
     h & !0xFF
 }
 
-/// One directory entry inside a hash bucket chain (Section 4.6).
+/// One directory entry inside a hash bucket chain 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DentryItem {
-    /// 1-byte collision index within the hash bucket (`0..=254`).
     pub collision_idx: u8,
-    /// POSIX `d_type` byte (`DT_REG`, `DT_DIR`, `DT_LNK`, etc.).
     pub file_type: u8,
-    /// Target child inode number.
     pub child_ino: u64,
-    /// Original un-normalized name bytes (1..=255 bytes).
     pub name: Vec<u8>,
 }
 

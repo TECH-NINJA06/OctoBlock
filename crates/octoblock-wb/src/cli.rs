@@ -1,41 +1,26 @@
-//! Section 17 Control-plane CLI command parser and executor (`octoblock <subcommand>`).
-
 use octoblock_fs::{Errno, Error, ROOT_INO, Result};
 use octopage_git::{ObjectId, Transport};
 
 use crate::WriteBackEngine;
 
-/// Parsed `octoblock` control-plane CLI command (Section 17).
+/// Parsed `octoblock` control-plane CLI command
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliCommand {
-    /// `octoblock status [--json]`
     Status { json: bool },
-    /// `octoblock sync`
     Sync,
-    /// `octoblock compact [--no-archive]`
     Compact { archive_generation: bool },
-    /// `octoblock branch list`
     BranchList,
-    /// `octoblock branch create <name>`
     BranchCreate { name: String },
-    /// `octoblock branch switch <name>`
     BranchSwitch { name: String },
-    /// `octoblock snapshot list`
     SnapshotList,
-    /// `octoblock snapshot create <name>`
     SnapshotCreate { name: String },
-    /// `octoblock merge <source_branch> <base_commit_hex>`
     Merge {
         source_branch: String,
         base_commit_hex: String,
     },
-    /// `octoblock lease status`
     LeaseStatus,
-    /// `octoblock lease break`
     LeaseBreak,
-    /// `octoblock conflicts`
     Conflicts,
-    /// `octoblock fsck`
     Fsck,
 }
 

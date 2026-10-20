@@ -1,12 +1,9 @@
-//! Section 12 Client-side page encryption (`OBEX`), commit signing, and pinned-signer
-//! verification (`REQ-5`, `REQ-8`).
-
 use bytes::Bytes;
 use octoblock_fs::page::PageId;
 use octoblock_fs::{Errno, Error, Result};
 use octopage_git::ObjectId;
 
-/// 4-byte magic header for encrypted remote page blobs (`OBEX`, Section 12.1).
+/// 4-byte magic header for encrypted remote page blobs 
 pub const OBEX_MAGIC: &[u8; 4] = b"OBEX";
 /// Current `OBEX` envelope format version.
 pub const OBEX_VERSION: u8 = 1;
@@ -42,7 +39,7 @@ pub fn sign_commit_metadata(
     (fp, sig_hex)
 }
 
-/// Format commit message trailers carrying the signer fingerprint and signature (Section 12.3).
+/// Format commit message trailers carrying the signer fingerprint and signature 
 pub fn format_signed_commit_message(
     base_message: &str,
     secret_key: &[u8; 32],
@@ -58,7 +55,7 @@ pub fn format_signed_commit_message(
     .into_bytes()
 }
 
-/// Verify a commit's signature trailers against `pinned_signers` and optional `secret_key` (Section 12.3, 12.4).
+/// Verify a commit's signature trailers against `pinned_signers` and optional `secret_key`
 pub fn verify_commit_signature(
     message: &[u8],
     tree_id: ObjectId,
@@ -119,7 +116,7 @@ pub fn verify_commit_signature(
     Ok(Some(fp))
 }
 
-/// Encrypt a raw `OBF1` page into an authenticated `OBEX` blob (`Section 12.1`, `REQ-8`).
+/// Encrypt a raw `OBF1` page into an authenticated `OBEX` blob
 pub fn encrypt_page_obex(
     master_key: &[u8; 32],
     page_id: PageId,

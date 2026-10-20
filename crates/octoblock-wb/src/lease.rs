@@ -1,33 +1,24 @@
-//! Section 7.1 & 7.2 Writer lease (`refs/octopage/lease`), mount roles, fencing (`EC-C04`),
-//! and forced lease break (`octoblock lease break`).
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use octoblock_fs::{Errno, Error, Result};
 use octopage_git::{Commit, ObjectId, ObjectKind, RefUpdate, Signature, Transport, Tree};
 use serde::{Deserialize, Serialize};
 
-/// Git reference used for the volume writer lease (Section 7.1, 7.2).
 pub const LEASE_REF: &str = "refs/octopage/lease";
-/// Default writer lease expiry in milliseconds: 60 seconds (Section 7.2, Appendix B).
 pub const DEFAULT_LEASE_EXPIRY_MS: i64 = 60_000;
-/// Default writer lease renewal interval in milliseconds: 20 seconds (Section 7.2, Appendix B).
 pub const DEFAULT_LEASE_RENEW_MS: i64 = 20_000;
 
 /// Mount concurrency role (Section 7.1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MountRole {
-    /// Holds the writer lease and is allowed to push commits.
     #[default]
     Writer,
-    /// Read-only mount (`EROFS` on writes) that follows remote head movements.
     Follower,
-    /// Opt-in multi-writer mode (`--lease advisory`) using logical replay on race loss.
     MultiWriter,
 }
 
-/// Writer lease enforcement policy (Section 7.2, Appendix B).
+/// Writer lease enforcement policy 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LeasePolicy {
@@ -40,7 +31,7 @@ pub enum LeasePolicy {
     Off,
 }
 
-/// On-remote lease payload stored in the commit message of `refs/octopage/lease` (Section 7.2).
+/// On-remote lease payload stored in the commit message of `refs/octopage/lease`
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseRecord {
     /// Human-readable holder identity (e.g., hostname or user).

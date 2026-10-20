@@ -1,23 +1,16 @@
-//! Section 6.3 & 6.8 Operation coalescing, write elision, and atomic regions (`REQ-3`).
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use octoblock_fs::oplog::{OpKind, OpRecord};
 use octoblock_fs::{Errno, Error, Result};
 
-/// Maximum size of an un-splittable atomic region: 128 MiB (Section 6.8, Appendix B, EC-Z08).
 pub const ATOMIC_MAX_BYTES: u64 = 128 * 1024 * 1024;
-/// Maximum size of a normal commit group before splitting: 64 MiB (Section 6.2, Appendix B, EC-Z08).
 pub const MAX_GROUP_BYTES: u64 = 64 * 1024 * 1024;
-/// Maximum ops in a normal commit group before splitting: 50,000 (Section 6.2, Appendix B, EC-Z08).
 pub const MAX_GROUP_OPS: usize = 50_000;
 
-/// Tracks an active `octoblock atomic` region (Section 6.8, REQ-3).
+/// Tracks an active `octoblock atomic` region
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AtomicRegion {
-    /// Whether an atomic region is currently open.
     pub active: bool,
-    /// Bytes accumulated inside the current atomic region.
     pub bytes: u64,
 }
 
@@ -32,7 +25,7 @@ impl AtomicRegion {
         Ok(())
     }
 
-    /// Record `n` dirty bytes inside the atomic region, failing with `EFBIG` above 128 MiB (Section 6.8).
+    /// Record `n` dirty bytes inside the atomic region, failing with `EFBIG` above 128 MiB
     pub fn record_bytes(&mut self, n: u64) -> Result<()> {
         if self.active {
             self.bytes = self.bytes.saturating_add(n);
@@ -59,9 +52,7 @@ impl AtomicRegion {
     }
 }
 
-/// Apply Section 6.3 coalescing and write elision to a window of [`OpRecord`]s.
-///
-/// Elision and coalescing never cross a `barrier` op (`REQ-3` / Section 6.3).
+/// Apply coalescing and write elision to a window of [`OpRecord`]s.
 pub fn coalesce_and_elide(ops: &[OpRecord]) -> Vec<OpRecord> {
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -79,7 +70,7 @@ pub fn coalesce_and_elide(ops: &[OpRecord]) -> Vec<OpRecord> {
 }
 
 fn coalesce_window(window: &[OpRecord]) -> Vec<OpRecord> {
-    // 1. Identify files created and unlinked inside the same barrier-free window (Write Elision, Section 6.3).
+    // 1. Identify files created and unlinked inside the same barrier-free window
     let mut created_in_group: BTreeMap<(u64, String), u64> = BTreeMap::new();
     let mut link_counts: BTreeMap<u64, u32> = BTreeMap::new();
     let mut elided_inodes: BTreeSet<u64> = BTreeSet::new();
@@ -131,8 +122,6 @@ fn coalesce_window(window: &[OpRecord]) -> Vec<OpRecord> {
         }
     }
 
-    // 2. Filter out all ops belonging to elided temporary inodes, drop zero-length writes,
-    // and coalesce identical page-range overwrites.
     let mut filtered: Vec<OpRecord> = Vec::with_capacity(window.len());
     for op in window {
         match &op.kind {
@@ -148,7 +137,6 @@ fn coalesce_window(window: &[OpRecord]) -> Vec<OpRecord> {
                 continue;
             }
             OpKind::Write { len: 0, .. } => {
-                // Section 6.3: zero-length writes are dropped.
                 continue;
             }
             OpKind::Write {
@@ -159,7 +147,6 @@ fn coalesce_window(window: &[OpRecord]) -> Vec<OpRecord> {
                 ..
             } => {
                 // Overwrite coalescing: if a prior write in the same window wrote the exact same
-                // (ino, off, len), replace it with the newer state.
                 if let Some(prev) = filtered.iter_mut().rev().find(| prev_op | {
                     matches!(
                         &prev_op.kind,

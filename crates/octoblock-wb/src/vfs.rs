@@ -6,24 +6,15 @@ use octopage_git::Transport;
 
 use crate::{DurabilityLevel, StatFs, WriteBackEngine};
 
-/// Virtual inode number for `/.octoblock` directory (Section 16.2).
 pub const VINO_OCTOBLOCK_DIR: u64 = 0xFFFF_0000_0000_0001;
-/// Virtual inode number for `/.octoblock/status`.
 pub const VINO_STATUS_FILE: u64 = 0xFFFF_0000_0000_0002;
-/// Virtual inode number for `/.octoblock/policy.toml`.
 pub const VINO_POLICY_FILE: u64 = 0xFFFF_0000_0000_0003;
-/// Virtual inode number for `/.octoblock/conflicts`.
 pub const VINO_CONFLICTS_DIR: u64 = 0xFFFF_0000_0000_0004;
-/// Virtual inode number for `/.octoblock/conflicts/index.json`.
 pub const VINO_CONFLICTS_INDEX: u64 = 0xFFFF_0000_0000_0005;
-/// Virtual inode number for `/.octoblock/snapshots`.
 pub const VINO_SNAPSHOTS_DIR: u64 = 0xFFFF_0000_0000_0006;
 
-/// `ioctl` command code to begin an un-splittable atomic commit group (`OBX_ATOMIC_BEGIN`, Section 6.8, REQ-3).
 pub const OBX_IOC_ATOMIC_BEGIN: u32 = 0x4F42_5801;
-/// `ioctl` command code to end an atomic commit group and flush (`OBX_ATOMIC_END`, Section 6.8, REQ-3).
 pub const OBX_IOC_ATOMIC_END: u32 = 0x4F42_5802;
-/// `ioctl` command code to force an immediate `L2` remote sync (`octoblock sync`).
 pub const OBX_IOC_SYNC_L2: u32 = 0x4F42_5803;
 
 /// VFS directory entry returned by [`VfsSession::readdir`].
@@ -178,7 +169,7 @@ impl<T: Transport> VfsSession<T> {
             .collect())
     }
 
-    /// Read bytes from any path, transparently routing `/.octoblock/snapshots/<tag>/<path>` (`Section 9.4`).
+    /// Read bytes from any path, transparently routing `/.octoblock/snapshots/<tag>/<path>`
     pub async fn read(&mut self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
         let norm = Self::normalize(path);
         if let Some((tag, inner)) = Self::split_snapshot_path(&norm) {

@@ -1,34 +1,21 @@
-//! OBF1 page types, 32-byte metadata page headers, and superblock encoding.
-
 use std::fmt;
 
 use bytes::Bytes;
 
 use crate::{Errno, Error, Result};
 
-/// The 4-byte magic at the start of every OctoBlock metadata page.
 pub const MAGIC: &[u8; 4] = b"OBF1";
-/// Size of the metadata page header in bytes.
 pub const HEADER_LEN: usize = 32;
-/// Maximum 24-bit page identifier (`16,777,215`).
 pub const MAX_PAGE_ID: u32 = (1 << 24) - 1;
-/// Allowed volume page sizes fixed at `mkfs` time.
 pub const PAGE_SIZES: [usize; 3] = [4096, 8192, 16384];
-/// Current major format version.
 pub const VERSION_MAJOR: u16 = 1;
-/// Current minor format version.
 pub const VERSION_MINOR: u16 = 0;
-/// Current client implementation version.
 pub const CLIENT_VERSION: u32 = 1;
 
-/// Page header flag indicating a B+tree leaf node (unset for interior nodes).
 pub const PAGE_FLAG_LEAF: u8 = 1 << 0;
 
-/// Known compatible feature mask supported by this build.
 pub const KNOWN_COMPAT: u32 = 0;
-/// Known read-only-compatible feature mask supported by this build.
 pub const KNOWN_RO_COMPAT: u32 = 0;
-/// Known incompatible feature mask supported by this build.
 pub const KNOWN_INCOMPAT: u32 = 0;
 
 const OFF_TYPE: usize = 4;
@@ -89,23 +76,14 @@ impl fmt::Debug for PageId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PageType {
-    /// Page 0: format version, feature flags, roots, counters, encryption metadata.
     Superblock = 1,
-    /// Copy-on-write B+tree interior or leaf keyed by inode number.
     InodeTree = 2,
-    /// Copy-on-write B+tree interior or leaf keyed by `(dir_ino, name_hash)`.
     DentryTree = 3,
-    /// Per-file B+tree interior or leaf keyed by file page index.
     ExtentTree = 4,
-    /// Extended attribute B+tree page.
     XattrLeaf = 5,
-    /// Headerless raw file data page.
     Data = 6,
-    /// Unlinked open inodes awaiting reclamation.
     OrphanLeaf = 7,
-    /// Allocation bitmap page (1 bit per page ID).
     FreeMap = 8,
-    /// Chain page for changelogs exceeding 1 MB.
     ChangelogIndex = 9,
 }
 
@@ -127,7 +105,7 @@ impl PageType {
     }
 }
 
-/// Directory name case-sensitivity policy fixed at `mkfs` (Section 4.4, EC-N05).
+/// Directory name case-sensitivity policy fixed at `mkfs`
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CasePolicy {
@@ -148,7 +126,7 @@ impl CasePolicy {
     }
 }
 
-/// Per-path persistence policy class stored in two bits of inode flags (Section 5.1).
+/// Per-path persistence policy class stored in two bits of inode flags
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PathClass {
@@ -342,56 +320,31 @@ impl MetaPageBuf {
     }
 }
 
-/// OctoBlock Section 4.4 Superblock (stored at Page 0).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Superblock {
-    /// Format major version.
     pub version_major: u16,
-    /// Format minor version.
     pub version_minor: u16,
-    /// Safe-to-ignore feature flags.
     pub compat_flags: u32,
-    /// Mount read-only if unknown bits are present.
     pub ro_compat_flags: u32,
-    /// Refuse to mount if unknown bits are present.
     pub incompat_flags: u32,
-    /// 16-byte volume UUID (also salts directory name hashes).
     pub uuid: [u8; 16],
-    /// Page size in bytes (4096, 8192, or 16384).
     pub page_size: u32,
-    /// Root page of the inode B+tree (0 if empty).
     pub inode_root: u32,
-    /// Root page of the dentry B+tree (0 if empty).
     pub dentry_root: u32,
-    /// Root page of the extended attribute B+tree (0 if empty).
     pub xattr_root: u32,
-    /// Root page of the orphan B+tree (0 if empty).
     pub orphan_root: u32,
-    /// First page of the free-map bitmap (`1`).
     pub free_map_root: u32,
-    /// Next unreserved inode number counter.
     pub next_ino: u64,
-    /// Count of live allocated pages at head (excluding system free-map/superblock).
     pub live_pages: u64,
-    /// Live bytes charged against the volume budget (`live_pages * page_size`).
     pub live_bytes: u64,
-    /// Total live inodes in the inode tree.
     pub inode_count: u64,
-    /// Commit sequence number.
     pub epoch: u64,
-    /// Object hash algorithm (`1` = SHA-1, `2` = SHA-256).
     pub hash_algo: u8,
-    /// Directory case-sensitivity policy.
     pub case_policy: CasePolicy,
-    /// Encryption mode (`0` = plain, `1` = random nonce, `2` = convergent).
     pub encryption_mode: u8,
-    /// Writer client version that created the volume.
     pub created_by: u32,
-    /// Minimum client version allowed to mount read-write.
     pub min_client: u32,
-    /// Number of dedicated free-map pages starting at `free_map_root`.
     pub map_pages: u32,
-    /// Optional policy blob SHA (length-prefixed up to 32 bytes).
     pub policy_sha: Vec<u8>,
 }
 
@@ -449,7 +402,7 @@ impl Superblock {
         id.get() <= self.map_pages
     }
 
-    /// Validate feature flags and `min_client` for a mount (Section 4.11, REQ-6, EC-U01, EC-U04).
+    /// Validate feature flags and `min_client` for a mount
     pub fn check_mount(&self, read_write: bool, client_version: u32) -> Result<()> {
         if self.incompat_flags & !KNOWN_INCOMPAT != 0 {
             return Err(Error::new(
@@ -480,7 +433,7 @@ impl Superblock {
         Ok(())
     }
 
-    /// Section 4.4: Commit validator ignores `epoch`, `live_*`, and `next_*` counters when
+    /// Commit validator ignores `epoch`, `live_*`, and `next_*` counters when
     /// checking whether two concurrent superblock updates conflict on structural fields.
     pub fn conflicts_with(&self, other: &Self) -> bool {
         self.version_major != other.version_major

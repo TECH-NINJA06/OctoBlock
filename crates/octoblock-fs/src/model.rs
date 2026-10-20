@@ -1,6 +1,3 @@
-//! Section 19.1 & 20 Differential in-memory reference model, `fsx` random byte-range stress
-//! tester, and the 1,000-point format-level crash-injection harness.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::page::CasePolicy;
@@ -231,7 +228,6 @@ impl RefModel {
         }
     }
 
-    /// Assert that `vol` matches `self` on every directory, inode, file byte, and xattr.
     /// Assert that `vol` matches `self` on every directory, inode, file byte, and xattr.
     pub fn assert_matches(&self, vol: &Volume) -> Result<()> {
         for (&ino, ref_node) in &self.inodes {
