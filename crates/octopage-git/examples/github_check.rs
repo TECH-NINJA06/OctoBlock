@@ -1,15 +1,3 @@
-//! This example runs a series of checks against a real GitHub repository.
-//!
-//! $env:OCTOPAGE_GITHUB_TOKEN = "github_pat_..."
-//! cargo run -p octopage-git --example github_check -- --repo OWNER/NAME
-//! ```
-//!
-//! Uses only `refs/heads/octopage-check/<run>` and `refs/octopage/check-<run>/...` and deletes them
-//! at the end. Authenticates only with the given token (never with saved git credentials).
-//!
-//! `--git-url URL` points the git checks at another smart-HTTP remote (such as
-//! `tools/local_git_remote.py`) and skips the REST and CDN checks, which need github.com.
-
 #[path = "../tests/support/fanout.rs"]
 mod fanout;
 
